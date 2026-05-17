@@ -62,18 +62,15 @@ public sealed class ProcessSpawner : IProcessSpawner
             CreatePipe(out stdErrRead, out stdErrWrite, true);
 
             // Step 3: Prepare process startup information.
-            // IMPORTANT: Do NOT set STARTF_USESHOWWINDOW — CreateProcessWithTokenW creates
-            // a new window station for the token's logon session and combining that flag
-            // with SW_HIDE causes error 1436 (child windows cannot have menus).
-            // CREATE_NO_WINDOW in the creation flags is sufficient to suppress the window.
-            // hStdInput must be NULL (not GetStdHandle) when running without a console
-            // (e.g. as a service) because GetStdHandle returns INVALID_HANDLE_VALUE there.
+            // bInheritHandles=true on CreateProcessAsUser means the pipe write handles
+            // are inherited by the child — no need for any special flags beyond
+            // STARTF_USESTDHANDLES. CREATE_NO_WINDOW suppresses any console window.
             var startupInfo = new NativeMethods.STARTUPINFO
             {
                 cb = Marshal.SizeOf<NativeMethods.STARTUPINFO>(),
-                dwFlags = NativeMethods.STARTF_USESTDHANDLES,   // no STARTF_USESHOWWINDOW
+                dwFlags = NativeMethods.STARTF_USESTDHANDLES,
                 wShowWindow = 0,
-                hStdInput = IntPtr.Zero,                         // NULL = no stdin
+                hStdInput = IntPtr.Zero,
                 hStdOutput = stdOutWrite.DangerousGetHandle(),
                 hStdError = stdErrWrite.DangerousGetHandle()
             };
@@ -83,26 +80,27 @@ public sealed class ProcessSpawner : IProcessSpawner
                 ? $"\"{executablePath}\""
                 : $"\"{executablePath}\" {arguments}";
 
-            // Use null working directory — CreateProcessWithTokenW validates the working
-            // directory under the new token's context, and an Identification-level S4U token
-            // may not have access to the exe's directory, causing ERROR_DIRECTORY (267).
-            // Passing null lets the process inherit the current working directory instead.
             string? workingDirectory = null;
 
             Console.WriteLine($"[ProcessSpawner] Executable: {executablePath}");
             Console.WriteLine($"[ProcessSpawner] CommandLine: {commandLine}");
             Console.WriteLine($"[ProcessSpawner] Exe exists:  {File.Exists(executablePath)}");
 
-            // Step 5: Create process with user token using CreateProcessWithTokenW.
-            // Unlike CreateProcessAsUser, CreateProcessWithTokenW accepts Identification-level
-            // tokens (which is what S4U2Self returns) and handles S4U2Proxy transparently.
-            var success = NativeMethods.CreateProcessWithTokenW(
+            // Step 5: Spawn the process under the delegated token.
+            // We use CreateProcessAsUser (not CreateProcessWithTokenW) because:
+            //   - Our token is Primary/Identification (S4U via DuplicateTokenEx)
+            //   - CreateProcessAsUser accepts Primary/Identification with SeTcbPrivilege
+            //   - CreateProcessWithTokenW requires Impersonation level (fails with 1346)
+            // bInheritHandles=true so the child inherits the stdout/stderr pipe handles.
+            var success = NativeMethods.CreateProcessAsUser(
                 token,
-                0,      // dwLogonFlags = 0
-                null,
+                null,           // lpApplicationName — use commandLine instead
                 commandLine,
+                IntPtr.Zero,    // default process security
+                IntPtr.Zero,    // default thread security
+                true,           // bInheritHandles — child inherits pipe handles
                 NativeMethods.CREATE_NO_WINDOW | NativeMethods.CREATE_UNICODE_ENVIRONMENT,
-                IntPtr.Zero,
+                IntPtr.Zero,    // inherit environment
                 workingDirectory,
                 ref startupInfo,
                 out NativeMethods.PROCESS_INFORMATION processInfo);
@@ -111,7 +109,7 @@ public sealed class ProcessSpawner : IProcessSpawner
             {
                 var error = Marshal.GetLastWin32Error();
                 throw new KerberosException(
-                    $"CreateProcessWithTokenW failed. Win32 error: {error} (0x{error:X8}). " +
+                    $"CreateProcessAsUser failed. Win32 error: {error} (0x{error:X8}). " +
                     $"Executable: {executablePath}",
                     error,
                     KerberosErrorType.ProcessSpawnFailed);

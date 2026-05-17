@@ -1066,16 +1066,20 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
         EnablePrivilege("SeImpersonatePrivilege");
         EnablePrivilege("SeAssignPrimaryTokenPrivilege");
 
-        // DuplicateTokenEx with SeTcbPrivilege enabled can promote an Identification
-        // token to Impersonation level and change its type to Primary in one call.
-        _logger.Information("[TokenManager] S4U2Proxy: calling DuplicateTokenEx to produce Primary token...");
+        // DuplicateTokenEx: keep the same impersonation level (Identification=1).
+        // We cannot request a higher level than the source token — that always fails
+        // with 1346 regardless of privileges held.
+        // We only change the TOKEN_TYPE from Impersonation-token to Primary-token.
+        // CreateProcessAsUser (not CreateProcessWithTokenW) accepts a
+        // Primary/Identification token when the caller holds SeTcbPrivilege.
+        _logger.Information("[TokenManager] S4U2Proxy: calling DuplicateTokenEx (Identification→Primary)...");
 
         bool ok = NativeMethods.DuplicateTokenEx(
             userToken,
             NativeMethods.TOKEN_ALL_ACCESS,
             IntPtr.Zero,
-            NativeMethods.SECURITY_IMPERSONATION,   // promote Identification → Impersonation
-            NativeMethods.TokenPrimary,              // CreateProcessAsUser requires Primary
+            NativeMethods.SECURITY_IDENTIFICATION,  // same level as source — cannot promote
+            NativeMethods.TokenPrimary,              // only the type changes
             out SafeAccessTokenHandle primaryToken);
 
         if (!ok || primaryToken == null || primaryToken.IsInvalid)
