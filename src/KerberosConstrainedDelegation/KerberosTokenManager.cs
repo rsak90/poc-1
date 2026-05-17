@@ -104,7 +104,7 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
 
             // Step 4: Validate delegated token represents correct user identity
             _logger.Information("[TokenManager] Step 4: Validating delegated token...");
-            ValidateToken(delegatedToken, username);
+            ValidateToken(delegatedToken, username, _logger);
             _logger.Information("[TokenManager] Step 4: Token validation successful");
 
             // Step 5: Return delegated token to caller (caller responsible for disposal)
@@ -305,26 +305,28 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
                         2 => "Impersonation",
                         _ => $"Unknown({stats.TokenType})"
                     };
-        // Fix ExpirationTime: TOKEN_STATISTICS.ExpirationTime is a LARGE_INTEGER in 100ns intervals.
-        // For S4U tokens it is often 0 or a sentinel value that is not a valid Win32 FILETIME,
-        // so DateTime.FromFileTime throws. Guard with a range check before converting.
-        string expirationStr;
-        try
-        {
-            // Valid FILETIME range: 1601-01-01 to 9999-12-31 (0 to ~2.65e17 ticks)
-            expirationStr = stats.ExpirationTime > 0 && stats.ExpirationTime < 2_650_467_743_999_999_999L
-                ? DateTime.FromFileTime(stats.ExpirationTime).ToString("u")
-                : $"(raw: 0x{stats.ExpirationTime:X16})";
-        }
-        catch
-        {
-            expirationStr = $"(raw: 0x{stats.ExpirationTime:X16})";
-        }
-                    log.Debug("[TokenDiag][{Label}]   TOKEN_STATISTICS.Type  : {TokenType} ({TokenTypeId})",   label, tokenType, stats.TokenType);
-                    log.Debug("[TokenDiag][{Label}]   TOKEN_STATISTICS.Level : {ImpLevel} ({ImpLevelId})",     label, impLevel, stats.ImpersonationLevel);
+
+                    // ExpirationTime is a LARGE_INTEGER (100ns ticks since 1601-01-01).
+                    // S4U tokens often carry 0 or a sentinel that is outside the valid
+                    // Win32 FILETIME range, causing DateTime.FromFileTime to throw.
+                    // Guard with a range check and fall back to the raw hex value.
+                    string expirationStr;
+                    try
+                    {
+                        expirationStr = stats.ExpirationTime > 0 && stats.ExpirationTime < 2_650_467_743_999_999_999L
+                            ? DateTime.FromFileTime(stats.ExpirationTime).ToString("u")
+                            : $"(raw: 0x{stats.ExpirationTime:X16})";
+                    }
+                    catch
+                    {
+                        expirationStr = $"(raw: 0x{stats.ExpirationTime:X16})";
+                    }
+
+                    log.Debug("[TokenDiag][{Label}]   TOKEN_STATISTICS.Type  : {TokenType} ({TokenTypeId})",      label, tokenType, stats.TokenType);
+                    log.Debug("[TokenDiag][{Label}]   TOKEN_STATISTICS.Level : {ImpLevel} ({ImpLevelId})",        label, impLevel, stats.ImpersonationLevel);
                     log.Debug("[TokenDiag][{Label}]   LogonId                : {LogonIdHigh:X8}:{LogonIdLow:X8}", label, stats.AuthenticationId.HighPart, stats.AuthenticationId.LowPart);
-                    log.Debug("[TokenDiag][{Label}]   ModifiedId             : {ModIdHigh:X8}:{ModIdLow:X8}",  label, stats.ModifiedId.HighPart, stats.ModifiedId.LowPart);
-                    log.Debug("[TokenDiag][{Label}]   ExpirationTime         : {ExpirationTime}",              label, expirationStr);
+                    log.Debug("[TokenDiag][{Label}]   ModifiedId             : {ModIdHigh:X8}:{ModIdLow:X8}",     label, stats.ModifiedId.HighPart, stats.ModifiedId.LowPart);
+                    log.Debug("[TokenDiag][{Label}]   ExpirationTime         : {ExpirationTime}",                 label, expirationStr);
                 }
                 else
                 {
@@ -595,7 +597,7 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
                     3 => "Delegation",
                     _ => $"Unknown({stats.ImpersonationLevel})"
                 };
-                _logger.Information("[TokenManager] Token impersonation level: {ImpLevel} ({ImpLevelId}) — forwardability determined by AD delegation config",
+                Log.Logger.Information("[TokenManager] Token impersonation level: {ImpLevel} ({ImpLevelId}) — forwardability determined by AD delegation config",
                     levelName, stats.ImpersonationLevel);
                 return true;
             }
@@ -866,7 +868,7 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
             }
 
             _logger.Information("[TokenManager] Service account authenticated successfully");
-            LogTokenDiagnostics("ServiceToken", token);
+            LogTokenDiagnostics("ServiceToken", token, _logger);
             return token;
         }
         catch (KerberosException)
@@ -944,7 +946,7 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
                 0,
                 KerberosErrorType.S4U2SelfFailed);
         }
-        _logger.Information("[TokenManager] Authentication package ID: {authPackage}");
+        _logger.Information("[TokenManager] Authentication package ID: {AuthPackageId}", authPackage);
 
         // Step 3: Build KERB_S4U_LOGON structure as a single contiguous memory block.
         //
@@ -1048,7 +1050,8 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
                 if (status != NativeMethods.STATUS_SUCCESS)
                 {
                     var win32Error = NativeMethods.LsaNtStatusToWinError(status);
-                    _logger.Error("[TokenManager] ERROR: LsaLogonUser (S4U2Self) failed with status: 0x{status:X8}, SubStatus: 0x{subStatus:X8}, Win32 error: {win32Error}");
+                    _logger.Error("[TokenManager] ERROR: LsaLogonUser (S4U2Self) failed with status: 0x{NtStatus:X8}, SubStatus: 0x{SubStatus:X8}, Win32 error: {Win32Error}",
+                        status, subStatus, win32Error);
 
                     if (status == NativeMethods.STATUS_NO_SUCH_USER)
                     {
@@ -1089,7 +1092,7 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
                 }
 
                 _logger.Information("[TokenManager] Token is forwardable - ExecuteS4U2Self completed successfully");
-                LogTokenDiagnostics("S4U2Self", token);
+                LogTokenDiagnostics("S4U2Self", token, _logger);
                 return token;
             }
             finally
@@ -1124,7 +1127,7 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
     /// <exception cref="KerberosException">Thrown when S4U2Proxy fails</exception>
     private SafeAccessTokenHandle ExecuteS4U2Proxy(SafeAccessTokenHandle userToken, string targetSpn)
     {
-        _logger.Information("[TokenManager] ExecuteS4U2Proxy called for target SPN: {targetSpn}");
+        _logger.Information("[TokenManager] ExecuteS4U2Proxy called for target SPN: {TargetSpn}", targetSpn);
 
         if (userToken == null || userToken.IsInvalid)
             throw new ArgumentException("Invalid user token handle", nameof(userToken));
@@ -1160,7 +1163,7 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
 
         _logger.Information("[TokenManager] ExecuteS4U2Proxy completed — token ready for CreateProcessWithTokenW");
         var dupToken = new SafeAccessTokenHandle(dupPtr);
-        LogTokenDiagnostics("S4U2Proxy", dupToken);
+        LogTokenDiagnostics("S4U2Proxy", dupToken, _logger);
         return dupToken;
     }
 
@@ -1184,7 +1187,7 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
                 out SafeAccessTokenHandle tokenHandle))
             {
                 var error = Marshal.GetLastWin32Error();
-                Log.Debug("[DEBUG] Failed to open process token. Error: {error}");
+                Log.Debug("[DEBUG] Failed to open process token. Error: {Win32Error}", error);
                 return; // Silently fail
             }
 
@@ -1197,12 +1200,12 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
                     out NativeMethods.LUID luid))
                 {
                     var error = Marshal.GetLastWin32Error();
-                    Log.Debug("[DEBUG] Failed to lookup SeTcbPrivilege. Error: {error}");
+                    Log.Debug("[DEBUG] Failed to lookup SeTcbPrivilege. Error: {Win32Error}", error);
                     Log.Debug("[DEBUG] This means the privilege is NOT assigned to your account.");
                     return; // Privilege doesn't exist or can't be looked up
                 }
 
-                Log.Debug("[DEBUG] SeTcbPrivilege LUID found: {luid.LowPart}");
+                Log.Debug("[DEBUG] SeTcbPrivilege LUID found: {LuidLowPart}", luid.LowPart);
 
                 // Prepare the TOKEN_PRIVILEGES structure
                 var tokenPrivileges = new NativeMethods.TOKEN_PRIVILEGES
@@ -1223,7 +1226,7 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
                     IntPtr.Zero))
                 {
                     var error = Marshal.GetLastWin32Error();
-                    Log.Debug("[DEBUG] AdjustTokenPrivileges failed. Error: {error}");
+                    Log.Debug("[DEBUG] AdjustTokenPrivileges failed. Error: {Win32Error}", error);
                     return;
                 }
 
@@ -1241,13 +1244,13 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
                 }
                 else
                 {
-                    Log.Debug("[DEBUG] AdjustTokenPrivileges returned error: {lastError}");
+                    Log.Debug("[DEBUG] AdjustTokenPrivileges returned error: {Win32Error}", lastError);
                 }
             }
         }
         catch (Exception ex)
         {
-            Log.Debug("[DEBUG] Exception in TryEnableSeTcbPrivilege: {ex.Message}");
+            Log.Debug(ex, "[DEBUG] Exception in TryEnableSeTcbPrivilege: {ErrorMessage}", ex.Message);
             // Silently fail - this is a best-effort attempt
         }
     }
