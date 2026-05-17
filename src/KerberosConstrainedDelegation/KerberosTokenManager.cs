@@ -42,7 +42,7 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
     /// <returns>Windows token handle with delegated credentials</returns>
     public SafeAccessTokenHandle GetDelegatedToken(string username, string targetServicePrincipalName)
     {
-        _logger.Information("[TokenManager] GetDelegatedToken called for user: {username}, target SPN: {targetServicePrincipalName}");
+        _logger.Information("[TokenManager] GetDelegatedToken called for user: {Username}, target SPN: {TargetSpn}", username, targetServicePrincipalName);
         
         if (string.IsNullOrWhiteSpace(username))
         {
@@ -75,7 +75,7 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
             _logger.Information("[TokenManager] Step 1: Service account authenticated successfully");
 
             // Step 2: Execute S4U2Self with service token and target username to get user token
-            _logger.Information("[TokenManager] Step 2: Executing S4U2Self for user: {username}");
+            _logger.Information("[TokenManager] Step 2: Executing S4U2Self for user: {Username}", username);
             userToken = ExecuteS4U2Self(serviceToken, username);
 
             if (userToken == null || userToken.IsInvalid)
@@ -89,7 +89,7 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
             _logger.Information("[TokenManager] Step 2: S4U2Self completed successfully");
 
             // Step 3: Execute S4U2Proxy with user token and target SPN to get delegated token
-            _logger.Information("[TokenManager] Step 3: Executing S4U2Proxy for SPN: {targetServicePrincipalName}");
+            _logger.Information("[TokenManager] Step 3: Executing S4U2Proxy for SPN: {TargetSpn}", targetServicePrincipalName);
             delegatedToken = ExecuteS4U2Proxy(userToken, targetServicePrincipalName);
 
             if (delegatedToken == null || delegatedToken.IsInvalid)
@@ -113,7 +113,7 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
         }
         catch (Exception ex)
         {
-            _logger.Error("[TokenManager] ERROR in GetDelegatedToken: {ex.Message}");
+            _logger.Error(ex, "[TokenManager] ERROR in GetDelegatedToken: {ErrorMessage}", ex.Message);
             // If an exception occurs, dispose the delegated token if it was created
             delegatedToken?.Dispose();
             throw;
@@ -149,18 +149,18 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
             // If authentication succeeds, the service account credentials are valid
             // Note: This doesn't verify delegation configuration in AD, but validates credentials
             bool isValid = serviceToken != null && !serviceToken.IsInvalid;
-            _logger.Information("[TokenManager] Delegation configuration validation result: {isValid}");
+            _logger.Information("[TokenManager] Delegation configuration validation result: {IsValid}", isValid);
             return isValid;
         }
         catch (KerberosException ex)
         {
-            _logger.Information("[TokenManager] Delegation configuration validation failed: {ex.Message}");
+            _logger.Warning(ex, "[TokenManager] Delegation configuration validation failed: {ErrorMessage}", ex.Message);
             // If authentication fails, delegation is not properly configured
             return false;
         }
         catch (Exception ex)
         {
-            _logger.Information("[TokenManager] Delegation configuration validation failed with exception: {ex.Message}");
+            _logger.Warning(ex, "[TokenManager] Delegation configuration validation failed with exception: {ErrorMessage}", ex.Message);
             // Any other exception means configuration is not valid
             return false;
         }
@@ -305,11 +305,26 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
                         2 => "Impersonation",
                         _ => $"Unknown({stats.TokenType})"
                     };
+        // Fix ExpirationTime: TOKEN_STATISTICS.ExpirationTime is a LARGE_INTEGER in 100ns intervals.
+        // For S4U tokens it is often 0 or a sentinel value that is not a valid Win32 FILETIME,
+        // so DateTime.FromFileTime throws. Guard with a range check before converting.
+        string expirationStr;
+        try
+        {
+            // Valid FILETIME range: 1601-01-01 to 9999-12-31 (0 to ~2.65e17 ticks)
+            expirationStr = stats.ExpirationTime > 0 && stats.ExpirationTime < 2_650_467_743_999_999_999L
+                ? DateTime.FromFileTime(stats.ExpirationTime).ToString("u")
+                : $"(raw: 0x{stats.ExpirationTime:X16})";
+        }
+        catch
+        {
+            expirationStr = $"(raw: 0x{stats.ExpirationTime:X16})";
+        }
                     log.Debug("[TokenDiag][{Label}]   TOKEN_STATISTICS.Type  : {TokenType} ({TokenTypeId})",   label, tokenType, stats.TokenType);
                     log.Debug("[TokenDiag][{Label}]   TOKEN_STATISTICS.Level : {ImpLevel} ({ImpLevelId})",     label, impLevel, stats.ImpersonationLevel);
                     log.Debug("[TokenDiag][{Label}]   LogonId                : {LogonIdHigh:X8}:{LogonIdLow:X8}", label, stats.AuthenticationId.HighPart, stats.AuthenticationId.LowPart);
                     log.Debug("[TokenDiag][{Label}]   ModifiedId             : {ModIdHigh:X8}:{ModIdLow:X8}",  label, stats.ModifiedId.HighPart, stats.ModifiedId.LowPart);
-                    log.Debug("[TokenDiag][{Label}]   ExpirationTime         : {ExpirationTime:u}",            label, DateTime.FromFileTime(stats.ExpirationTime));
+                    log.Debug("[TokenDiag][{Label}]   ExpirationTime         : {ExpirationTime}",              label, expirationStr);
                 }
                 else
                 {
@@ -580,7 +595,8 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
                     3 => "Delegation",
                     _ => $"Unknown({stats.ImpersonationLevel})"
                 };
-                _logger.Information("[TokenManager] Token impersonation level: {levelName} ({stats.ImpersonationLevel}) — forwardability determined by AD delegation config");
+                _logger.Information("[TokenManager] Token impersonation level: {ImpLevel} ({ImpLevelId}) — forwardability determined by AD delegation config",
+                    levelName, stats.ImpersonationLevel);
                 return true;
             }
             finally
@@ -611,7 +627,8 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
     /// <exception cref="KerberosException">Thrown when registration fails</exception>
     public uint RegisterLsaAuthenticationPackage(string packageName = "Negotiate", bool requireTrustedConnection = true)
     {
-        _logger.Information("[TokenManager] RegisterLsaAuthenticationPackage called with package: {packageName}, requireTrustedConnection: {requireTrustedConnection}");
+        _logger.Information("[TokenManager] RegisterLsaAuthenticationPackage called with package: {PackageName}, requireTrustedConnection: {RequireTrustedConnection}",
+            packageName, requireTrustedConnection);
         
         if (string.IsNullOrWhiteSpace(packageName))
         {
@@ -621,7 +638,7 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
         // If already registered, return cached value
         if (_lsaHandle != IntPtr.Zero && _authenticationPackage != 0)
         {
-            _logger.Information("[TokenManager] Using cached LSA handle and authentication package: {_authenticationPackage}");
+            _logger.Information("[TokenManager] Using cached LSA handle and authentication package: {AuthPackageId}", _authenticationPackage);
             return _authenticationPackage;
         }
 
@@ -649,7 +666,8 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
                     if (status != NativeMethods.STATUS_SUCCESS)
                     {
                         var win32Error = NativeMethods.LsaNtStatusToWinError(status);
-                        _logger.Error("[TokenManager] ERROR: LsaRegisterLogonProcess failed with status: 0x{status:X8}, Win32 error: {win32Error}");
+                        _logger.Error("[TokenManager] ERROR: LsaRegisterLogonProcess failed with status: 0x{NtStatus:X8}, Win32 error: {Win32Error}",
+                            status, win32Error);
                         
                         if (status == NativeMethods.STATUS_PRIVILEGE_NOT_HELD)
                         {
@@ -686,7 +704,7 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
                 // If LsaConnectUntrusted fails, try LsaRegisterLogonProcess
                 if (status != NativeMethods.STATUS_SUCCESS)
                 {
-                    _logger.Information("[TokenManager] LsaConnectUntrusted failed with status: 0x{status:X8}, trying LsaRegisterLogonProcess...");
+                    _logger.Warning("[TokenManager] LsaConnectUntrusted failed with status: 0x{NtStatus:X8}, trying LsaRegisterLogonProcess...", status);
                     TryEnableSeTcbPrivilege();
                     
                     var processName = NativeMethods.CreateLsaString("KerberosConstrainedDelegation");
@@ -736,7 +754,8 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
                     if (status == NativeMethods.STATUS_SUCCESS && _authenticationPackage != 0)
                     {
                         // Success! Return the valid package ID
-                        _logger.Information("[TokenManager] Successfully registered authentication package '{pkgName}' with ID: {_authenticationPackage}");
+                        _logger.Information("[TokenManager] Successfully registered authentication package '{PkgName}' with ID: {AuthPackageId}",
+                            pkgName, _authenticationPackage);
                         return _authenticationPackage;
                     }
 
@@ -799,7 +818,7 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
             throw new InvalidOperationException("Service credentials are not initialized");
         }
 
-        _logger.Information("[TokenManager] Authenticating service account: {_serviceCredentials.FullyQualifiedUsername}");
+        _logger.Information("[TokenManager] Authenticating service account: {ServiceAccount}", _serviceCredentials.FullyQualifiedUsername);
         
         // Convert SecureString password to plain text for LogonUser API
         IntPtr passwordPtr = IntPtr.Zero;
@@ -829,7 +848,7 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
             if (!success)
             {
                 var win32Error = Marshal.GetLastWin32Error();
-                _logger.Error("[TokenManager] ERROR: LogonUser failed with Win32 error: 0x{win32Error:X8}");
+                _logger.Error("[TokenManager] ERROR: LogonUser failed with Win32 error: 0x{Win32Error:X8}", win32Error);
                 throw new KerberosException(
                     $"Service account authentication failed for {_serviceCredentials.FullyQualifiedUsername}. Win32 error: 0x{win32Error:X8}",
                     win32Error,
@@ -881,7 +900,7 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
     /// <exception cref="KerberosException">Thrown when S4U2Self fails</exception>
     private SafeAccessTokenHandle ExecuteS4U2Self(SafeAccessTokenHandle serviceToken, string username)
     {
-        _logger.Information("[TokenManager] ExecuteS4U2Self called for username: {username}");
+        _logger.Information("[TokenManager] ExecuteS4U2Self called for username: {Username}", username);
         
         if (serviceToken == null || serviceToken.IsInvalid)
         {
@@ -895,7 +914,7 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
 
         // Step 1: Parse username into domain and account components
         var (userDomain, account) = ParseUsername(username);
-        _logger.Information("[TokenManager] Parsed username - Domain: {userDomain}, Account: {account}");
+        _logger.Information("[TokenManager] Parsed username - Domain: {UserDomain}, Account: {Account}", userDomain, account);
 
         // ClientRealm must be the SERVICE ACCOUNT's domain (the local domain whose DC
         // we are contacting), NOT the user's domain. The local DC uses the cross-domain
@@ -907,7 +926,8 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
         // it the DC returns STATUS_NO_TRUST_SAM_ACCOUNT for users in trusted domains.
         string clientRealm = _serviceCredentials.Domain;
         uint s4uFlags = NativeMethods.S4U_LOGON_FLAG_IDENTITY;
-        _logger.Information("[TokenManager] S4U ClientUpn='{username}', ClientRealm='{clientRealm}' (service domain), Flags=0x{s4uFlags:X}");
+        _logger.Information("[TokenManager] S4U ClientUpn='{ClientUpn}', ClientRealm='{ClientRealm}' (service domain), Flags=0x{S4UFlags:X}",
+            username, clientRealm, s4uFlags);
 
         // Step 2: Register LSA authentication package
         // Must use "Kerberos" (not "Negotiate") for S4U operations — Negotiate
