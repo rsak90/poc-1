@@ -943,14 +943,15 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
                 };
 
                 // Step 5: Call LsaLogonUser API with S4U2Self request.
-                // Network (3) is the correct logon type for S4U — the token level
-                // (Identification) is handled in ExecuteS4U2Proxy via the
-                // Impersonate → OpenThreadToken → DuplicateTokenEx pattern.
-                _logger.Information("[TokenManager] Calling LsaLogonUser for S4U2Self (logon type: Network)...");
+                // Use Batch (4) logon type — the reference S4U implementation by Jordan Borean
+                // (https://gist.github.com/jborean93/ca63f50ecaa9be5b517df5ad3433d461) confirms
+                // Batch produces a token usable with CreateProcessWithTokenW.
+                // Network (3) produces Identification-level which CreateProcessWithTokenW rejects.
+                _logger.Information("[TokenManager] Calling LsaLogonUser for S4U2Self (logon type: Batch=4)...");
                 var status = NativeMethods.LsaLogonUser(
                     _lsaHandle,
                     ref originName,
-                    NativeMethods.Network,
+                    NativeMethods.Batch,
                     authPackage,
                     s4uLogonPtr,
                     (uint)totalSize,
@@ -1055,23 +1056,20 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
         if (string.IsNullOrWhiteSpace(targetSpn))
             throw new ArgumentException("Target SPN cannot be null or empty", nameof(targetSpn));
 
-        // Enable all privileges required by CreateProcessAsUser.
-        // SeTcbPrivilege + SeAssignPrimaryTokenPrivilege + SeIncreaseQuotaPrivilege
-        // allow CreateProcessAsUser to accept an Identification-level token directly —
-        // the OS performs the Primary token conversion internally.
-        // DuplicateTokenEx on an S4U Identification token always fails with 1346
-        // because the kernel blocks Impersonation→Primary promotion for S4U tokens
-        // regardless of what privileges are held.
+        // LsaLogonUser with Batch logon type (4) returns an Impersonation-type token.
+        // CreateProcessWithTokenW (not CreateProcessAsUser) accepts Impersonation-type
+        // tokens and is the correct API for this pattern — as confirmed by the reference
+        // S4U implementation at https://gist.github.com/jborean93/ca63f50ecaa9be5b517df5ad3433d461
+        // No DuplicateTokenEx needed — return the token directly.
         EnablePrivilege(NativeMethods.SE_TCB_NAME);
         EnablePrivilege("SeImpersonatePrivilege");
         EnablePrivilege("SeAssignPrimaryTokenPrivilege");
         EnablePrivilege("SeIncreaseQuotaPrivilege");
 
-        _logger.Information("[TokenManager] ExecuteS4U2Proxy: privileges enabled, returning S4U token for CreateProcessAsUser");
+        _logger.Information("[TokenManager] ExecuteS4U2Proxy: returning S4U token for CreateProcessWithTokenW");
         LogTokenInfo("S4U2Proxy", userToken);
 
-        // Return the S4U token as-is. CreateProcessAsUser in ProcessSpawner will use it.
-        // We duplicate the handle so the caller owns an independent reference.
+        // Duplicate the handle so the caller owns an independent reference.
         bool ok = NativeMethods.DuplicateHandle(
             NativeMethods.GetCurrentProcess(),
             userToken.DangerousGetHandle(),

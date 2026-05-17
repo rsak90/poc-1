@@ -87,20 +87,17 @@ public sealed class ProcessSpawner : IProcessSpawner
             Console.WriteLine($"[ProcessSpawner] Exe exists:  {File.Exists(executablePath)}");
 
             // Step 5: Spawn the process under the delegated token.
-            // We use CreateProcessAsUser (not CreateProcessWithTokenW) because:
-            //   - Our token is Primary/Identification (S4U via DuplicateTokenEx)
-            //   - CreateProcessAsUser accepts Primary/Identification with SeTcbPrivilege
-            //   - CreateProcessWithTokenW requires Impersonation level (fails with 1346)
-            // bInheritHandles=true so the child inherits the stdout/stderr pipe handles.
-            var success = NativeMethods.CreateProcessAsUser(
+            // CreateProcessWithTokenW accepts Impersonation-type tokens (which is what
+            // LsaLogonUser S4U returns). CreateProcessAsUser requires a Primary token
+            // and fails with 1346 on S4U tokens.
+            // SeImpersonatePrivilege is required and is enabled in ExecuteS4U2Proxy.
+            var success = NativeMethods.CreateProcessWithTokenW(
                 token,
-                null,           // lpApplicationName — use commandLine instead
+                0,          // dwLogonFlags
+                null,
                 commandLine,
-                IntPtr.Zero,    // default process security
-                IntPtr.Zero,    // default thread security
-                true,           // bInheritHandles — child inherits pipe handles
                 NativeMethods.CREATE_NO_WINDOW | NativeMethods.CREATE_UNICODE_ENVIRONMENT,
-                IntPtr.Zero,    // inherit environment
+                IntPtr.Zero,
                 workingDirectory,
                 ref startupInfo,
                 out NativeMethods.PROCESS_INFORMATION processInfo);
@@ -109,7 +106,7 @@ public sealed class ProcessSpawner : IProcessSpawner
             {
                 var error = Marshal.GetLastWin32Error();
                 throw new KerberosException(
-                    $"CreateProcessAsUser failed. Win32 error: {error} (0x{error:X8}). " +
+                    $"CreateProcessWithTokenW failed. Win32 error: {error} (0x{error:X8}). " +
                     $"Executable: {executablePath}",
                     error,
                     KerberosErrorType.ProcessSpawnFailed);
