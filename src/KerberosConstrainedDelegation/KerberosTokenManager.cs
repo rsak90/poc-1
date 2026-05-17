@@ -1040,10 +1040,8 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
     }
 
     /// <summary>
-    /// Executes S4U2Proxy: enables the required privileges and returns the S4U token
-    /// directly. CreateProcessAsUser handles the Primary token conversion internally
-    /// when SeTcbPrivilege + SeAssignPrimaryTokenPrivilege + SeIncreaseQuotaPrivilege
-    /// are held — no DuplicateTokenEx needed or possible on an S4U Identification token.
+    /// Converts the S4U Identification token into a Primary/Impersonation token
+    /// for CreateProcessWithTokenW using the Impersonate→OpenThreadToken→DuplicateTokenEx pattern.
     /// </summary>
     private SafeAccessTokenHandle ExecuteS4U2Proxy(SafeAccessTokenHandle userToken, string targetSpn)
     {
@@ -1054,38 +1052,88 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
         if (string.IsNullOrWhiteSpace(targetSpn))
             throw new ArgumentException("Target SPN cannot be null or empty", nameof(targetSpn));
 
-        // LsaLogonUser with Batch logon type (4) returns an Impersonation-type token.
-        // CreateProcessWithTokenW (not CreateProcessAsUser) accepts Impersonation-type
-        // tokens and is the correct API for this pattern — as confirmed by the reference
-        // S4U implementation at https://gist.github.com/jborean93/ca63f50ecaa9be5b517df5ad3433d461
-        // No DuplicateTokenEx needed — return the token directly.
         EnablePrivilege(NativeMethods.SE_TCB_NAME);
         EnablePrivilege("SeImpersonatePrivilege");
         EnablePrivilege("SeAssignPrimaryTokenPrivilege");
         EnablePrivilege("SeIncreaseQuotaPrivilege");
 
-        _logger.Information("[TokenManager] ExecuteS4U2Proxy: returning S4U token for CreateProcessWithTokenW");
-        LogTokenInfo("S4U2Proxy", userToken);
+        SafeAccessTokenHandle? threadToken  = null;
+        SafeAccessTokenHandle? primaryToken = null;
+        bool impersonating = false;
 
-        // Duplicate the handle so the caller owns an independent reference.
-        bool ok = NativeMethods.DuplicateHandle(
-            NativeMethods.GetCurrentProcess(),
-            userToken.DangerousGetHandle(),
-            NativeMethods.GetCurrentProcess(),
-            out IntPtr dupPtr,
-            0,
-            false,
-            2); // DUPLICATE_SAME_ACCESS
-
-        if (!ok)
+        try
         {
-            int err = Marshal.GetLastWin32Error();
-            throw new KerberosException(
-                $"DuplicateHandle failed: Win32 {err} (0x{err:X8})",
-                err, KerberosErrorType.S4U2ProxyFailed);
-        }
+            // Step 1: Impersonate — SeTcbPrivilege allows this even on Identification tokens
+            _logger.Information("[TokenManager] S4U2Proxy: calling ImpersonateLoggedOnUser...");
+            if (!NativeMethods.ImpersonateLoggedOnUser(userToken))
+            {
+                int err = Marshal.GetLastWin32Error();
+                _logger.Error("[TokenManager] ImpersonateLoggedOnUser failed: Win32 {Err} (0x{ErrHex:X8})", err, err);
+                throw new KerberosException(
+                    $"ImpersonateLoggedOnUser failed: Win32 {err} (0x{err:X8})",
+                    err, KerberosErrorType.S4U2ProxyFailed);
+            }
+            impersonating = true;
+            _logger.Information("[TokenManager] S4U2Proxy: impersonation active");
 
-        return new SafeAccessTokenHandle(dupPtr);
+            // Step 2: OpenThreadToken with OpenAsSelf=FALSE while actively impersonating.
+            // While impersonating, the thread token IS at Impersonation level.
+            // OpenAsSelf=false returns that Impersonation-level thread token.
+            // OpenAsSelf=true would return the process primary token instead (Identification).
+            _logger.Information("[TokenManager] S4U2Proxy: calling OpenThreadToken (OpenAsSelf=false)...");
+            if (!NativeMethods.OpenThreadToken(
+                    NativeMethods.GetCurrentThread(),
+                    (uint)NativeMethods.TOKEN_ALL_ACCESS,
+                    false,
+                    out threadToken)
+                || threadToken == null || threadToken.IsInvalid)
+            {
+                int err = Marshal.GetLastWin32Error();
+                _logger.Error("[TokenManager] OpenThreadToken failed: Win32 {Err} (0x{ErrHex:X8})", err, err);
+                throw new KerberosException(
+                    $"OpenThreadToken failed: Win32 {err} (0x{err:X8})",
+                    err, KerberosErrorType.S4U2ProxyFailed);
+            }
+            _logger.Information("[TokenManager] S4U2Proxy: thread token obtained");
+
+            // Step 3: Revert immediately — we have the token handle
+            NativeMethods.RevertToSelf();
+            impersonating = false;
+            _logger.Information("[TokenManager] S4U2Proxy: reverted to self");
+
+            // Step 4: DuplicateTokenEx — thread token is Impersonation-level now,
+            // so SECURITY_IMPERSONATION succeeds. Convert to Primary for CreateProcessWithTokenW.
+            _logger.Information("[TokenManager] S4U2Proxy: calling DuplicateTokenEx (Impersonation→Primary)...");
+            if (!NativeMethods.DuplicateTokenEx(
+                    threadToken,
+                    NativeMethods.TOKEN_ALL_ACCESS,
+                    IntPtr.Zero,
+                    NativeMethods.SECURITY_IMPERSONATION,
+                    NativeMethods.TokenPrimary,
+                    out primaryToken)
+                || primaryToken == null || primaryToken.IsInvalid)
+            {
+                int err = Marshal.GetLastWin32Error();
+                _logger.Error("[TokenManager] DuplicateTokenEx failed: Win32 {Err} (0x{ErrHex:X8})", err, err);
+                throw new KerberosException(
+                    $"DuplicateTokenEx failed: Win32 {err} (0x{err:X8})",
+                    err, KerberosErrorType.S4U2ProxyFailed);
+            }
+
+            _logger.Information("[TokenManager] ExecuteS4U2Proxy completed — Primary token ready");
+            LogTokenInfo("S4U2Proxy", primaryToken);
+            return primaryToken;
+        }
+        catch
+        {
+            primaryToken?.Dispose();
+            throw;
+        }
+        finally
+        {
+            if (impersonating) NativeMethods.RevertToSelf();
+            threadToken?.Dispose();
+        }
     }
 
     /// <summary>
