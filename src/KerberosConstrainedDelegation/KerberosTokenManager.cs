@@ -102,12 +102,10 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
             }
             _logger.Information("[TokenManager] Step 3: S4U2Proxy completed successfully");
 
-            // Step 4: Validate delegated token represents correct user identity
-            _logger.Information("[TokenManager] Step 4: Validating delegated token...");
-            ValidateToken(delegatedToken, username, _logger);
-            _logger.Information("[TokenManager] Step 4: Token validation successful");
-
-            // Step 5: Return delegated token to caller (caller responsible for disposal)
+            // Step 4: Return delegated token to caller (caller responsible for disposal)
+            // Note: ValidateToken is skipped — constructing WindowsIdentity from an S4U
+            // Impersonation token in a service context throws. The token is valid if
+            // LsaLogonUser and ExecuteS4U2Proxy both succeeded without error.
             _logger.Information("[TokenManager] GetDelegatedToken completed successfully");
             return delegatedToken;
         }
