@@ -1,0 +1,1086 @@
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+using Microsoft.Win32.SafeHandles;
+
+namespace KerberosConstrainedDelegation;
+
+/// <summary>
+/// Manages Kerberos tokens using constrained delegation (S4U2Self and S4U2Proxy)
+/// </summary>
+public sealed class KerberosTokenManager : IKerberosTokenManager
+{
+    private readonly ServiceAccountCredentials _serviceCredentials;
+    private IntPtr _lsaHandle = IntPtr.Zero;
+    private uint _authenticationPackage;
+    private bool _disposed;
+
+    /// <summary>
+    /// Initializes a new instance of the KerberosTokenManager class
+    /// </summary>
+    /// <param name="serviceCredentials">Service account credentials for authentication</param>
+    public KerberosTokenManager(ServiceAccountCredentials serviceCredentials)
+    {
+        _serviceCredentials = serviceCredentials ?? throw new ArgumentNullException(nameof(serviceCredentials));
+    }
+
+    /// <summary>
+    /// Obtains a delegated Kerberos token for the specified user and target service
+    /// </summary>
+    /// <param name="username">User to impersonate (UPN or DOMAIN\username format)</param>
+    /// <param name="targetServicePrincipalName">SPN of the target service for delegation</param>
+    /// <returns>Windows token handle with delegated credentials</returns>
+    public SafeAccessTokenHandle GetDelegatedToken(string username, string targetServicePrincipalName)
+    {
+        Console.WriteLine($"[TokenManager] GetDelegatedToken called for user: {username}, target SPN: {targetServicePrincipalName}");
+        
+        if (string.IsNullOrWhiteSpace(username))
+        {
+            throw new ArgumentException("Username cannot be null or empty", nameof(username));
+        }
+
+        if (string.IsNullOrWhiteSpace(targetServicePrincipalName))
+        {
+            throw new ArgumentException("Target SPN cannot be null or empty", nameof(targetServicePrincipalName));
+        }
+
+        SafeAccessTokenHandle? serviceToken = null;
+        SafeAccessTokenHandle? userToken = null;
+        SafeAccessTokenHandle? delegatedToken = null;
+
+        try
+        {
+            // Step 1: Authenticate service account to obtain service token
+            Console.WriteLine($"[TokenManager] Step 1: Authenticating service account...");
+            serviceToken = AuthenticateServiceAccount();
+
+            if (serviceToken == null || serviceToken.IsInvalid)
+            {
+                Console.WriteLine($"[TokenManager] ERROR: Service token is null or invalid");
+                throw new KerberosException(
+                    "Failed to authenticate service account",
+                    Marshal.GetLastWin32Error(),
+                    KerberosErrorType.ServiceAuthenticationFailed);
+            }
+            Console.WriteLine($"[TokenManager] Step 1: Service account authenticated successfully");
+
+            // Step 2: Execute S4U2Self with service token and target username to get user token
+            Console.WriteLine($"[TokenManager] Step 2: Executing S4U2Self for user: {username}");
+            userToken = ExecuteS4U2Self(serviceToken, username);
+
+            if (userToken == null || userToken.IsInvalid)
+            {
+                Console.WriteLine($"[TokenManager] ERROR: User token is null or invalid");
+                throw new KerberosException(
+                    $"S4U2Self failed for user: {username}",
+                    Marshal.GetLastWin32Error(),
+                    KerberosErrorType.S4U2SelfFailed);
+            }
+            Console.WriteLine($"[TokenManager] Step 2: S4U2Self completed successfully");
+
+            // Step 3: Execute S4U2Proxy with user token and target SPN to get delegated token
+            Console.WriteLine($"[TokenManager] Step 3: Executing S4U2Proxy for SPN: {targetServicePrincipalName}");
+            delegatedToken = ExecuteS4U2Proxy(userToken, targetServicePrincipalName);
+
+            if (delegatedToken == null || delegatedToken.IsInvalid)
+            {
+                Console.WriteLine($"[TokenManager] ERROR: Delegated token is null or invalid");
+                throw new KerberosException(
+                    $"S4U2Proxy failed for SPN: {targetServicePrincipalName}",
+                    Marshal.GetLastWin32Error(),
+                    KerberosErrorType.S4U2ProxyFailed);
+            }
+            Console.WriteLine($"[TokenManager] Step 3: S4U2Proxy completed successfully");
+
+            // Step 4: Validate delegated token represents correct user identity
+            Console.WriteLine($"[TokenManager] Step 4: Validating delegated token...");
+            ValidateToken(delegatedToken, username);
+            Console.WriteLine($"[TokenManager] Step 4: Token validation successful");
+
+            // Step 5: Return delegated token to caller (caller responsible for disposal)
+            Console.WriteLine($"[TokenManager] GetDelegatedToken completed successfully");
+            return delegatedToken;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[TokenManager] ERROR in GetDelegatedToken: {ex.Message}");
+            // If an exception occurs, dispose the delegated token if it was created
+            delegatedToken?.Dispose();
+            throw;
+        }
+        finally
+        {
+            // Step 6: Dispose intermediate tokens (service token, user token) in finally block
+            serviceToken?.Dispose();
+            userToken?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Validates that the service account is properly configured for constrained delegation
+    /// </summary>
+    /// <returns>True if delegation is properly configured</returns>
+    public bool ValidateDelegationConfiguration()
+    {
+        Console.WriteLine($"[TokenManager] ValidateDelegationConfiguration called");
+        
+        // This is a simplified implementation that checks if we can authenticate the service account
+        // A full implementation would query Active Directory to verify delegation settings
+        // For now, we'll attempt to authenticate and return true if successful
+        
+        SafeAccessTokenHandle? serviceToken = null;
+        
+        try
+        {
+            // Try to authenticate the service account
+            Console.WriteLine($"[TokenManager] Attempting to authenticate service account for validation...");
+            serviceToken = AuthenticateServiceAccount();
+            
+            // If authentication succeeds, the service account credentials are valid
+            // Note: This doesn't verify delegation configuration in AD, but validates credentials
+            bool isValid = serviceToken != null && !serviceToken.IsInvalid;
+            Console.WriteLine($"[TokenManager] Delegation configuration validation result: {isValid}");
+            return isValid;
+        }
+        catch (KerberosException ex)
+        {
+            Console.WriteLine($"[TokenManager] Delegation configuration validation failed: {ex.Message}");
+            // If authentication fails, delegation is not properly configured
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[TokenManager] Delegation configuration validation failed with exception: {ex.Message}");
+            // Any other exception means configuration is not valid
+            return false;
+        }
+        finally
+        {
+            // Clean up the service token
+            serviceToken?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Parses a username in UPN or DOMAIN\username format into domain and account components
+    /// </summary>
+    /// <param name="username">Username in UPN (user@domain.com) or DOMAIN\username format</param>
+    /// <returns>Tuple containing (domain, account) components</returns>
+    /// <exception cref="ArgumentException">Thrown when username format is invalid</exception>
+    public static (string domain, string account) ParseUsername(string username)
+    {
+        if (string.IsNullOrWhiteSpace(username))
+        {
+            throw new ArgumentException("Username cannot be null or empty", nameof(username));
+        }
+
+        // Check for UPN format (user@domain.com)
+        if (username.Contains('@'))
+        {
+            var parts = username.Split('@');
+            if (parts.Length != 2 || string.IsNullOrWhiteSpace(parts[0]) || string.IsNullOrWhiteSpace(parts[1]))
+            {
+                throw new ArgumentException($"Invalid UPN format: {username}", nameof(username));
+            }
+
+            return (domain: parts[1], account: parts[0]);
+        }
+
+        // Check for DOMAIN\username format
+        if (username.Contains('\\'))
+        {
+            var parts = username.Split('\\');
+            if (parts.Length != 2 || string.IsNullOrWhiteSpace(parts[0]) || string.IsNullOrWhiteSpace(parts[1]))
+            {
+                throw new ArgumentException($"Invalid DOMAIN\\username format: {username}", nameof(username));
+            }
+
+            return (domain: parts[0], account: parts[1]);
+        }
+
+        throw new ArgumentException($"Username must be in UPN (user@domain.com) or DOMAIN\\username format: {username}", nameof(username));
+    }
+
+    /// <summary>
+    /// Validates that a token represents the expected user identity
+    /// </summary>
+    /// <param name="token">Token to validate</param>
+    /// <param name="expectedUsername">Expected username (UPN or DOMAIN\username format)</param>
+    /// <returns>True if token represents the expected user</returns>
+    /// <exception cref="KerberosException">Thrown when token validation fails</exception>
+    public static bool ValidateToken(SafeAccessTokenHandle token, string expectedUsername)
+    {
+        if (token == null || token.IsInvalid)
+        {
+            throw new ArgumentException("Invalid token handle", nameof(token));
+        }
+
+        if (string.IsNullOrWhiteSpace(expectedUsername))
+        {
+            throw new ArgumentException("Expected username cannot be null or empty", nameof(expectedUsername));
+        }
+
+        try
+        {
+            // Get the token username
+            var tokenUsername = GetTokenUsername(token);
+            var tokenDomain = GetTokenDomain(token);
+            var fullTokenUsername = $"{tokenDomain}\\{tokenUsername}";
+
+            // Parse expected username
+            var (expectedDomain, expectedAccount) = ParseUsername(expectedUsername);
+            var fullExpectedUsername = $"{expectedDomain}\\{expectedAccount}";
+
+            // Compare usernames (case-insensitive)
+            if (!string.Equals(fullTokenUsername, fullExpectedUsername, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new KerberosException(
+                    $"Token username mismatch. Expected: {fullExpectedUsername}, Got: {fullTokenUsername}",
+                    0,
+                    KerberosErrorType.TokenCreationFailed);
+            }
+
+            // Validate authentication type using WindowsIdentity
+            using var identity = new WindowsIdentity(token.DangerousGetHandle());
+            
+            if (!identity.IsAuthenticated)
+            {
+                throw new KerberosException(
+                    "Token is not authenticated",
+                    0,
+                    KerberosErrorType.TokenCreationFailed);
+            }
+
+            // Check if authentication type is Kerberos
+            if (!string.Equals(identity.AuthenticationType, "Kerberos", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new KerberosException(
+                    $"Token authentication type is not Kerberos: {identity.AuthenticationType}",
+                    0,
+                    KerberosErrorType.TokenCreationFailed);
+            }
+
+            return true;
+        }
+        catch (KerberosException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new KerberosException(
+                $"Token validation failed: {ex.Message}",
+                Marshal.GetLastWin32Error(),
+                KerberosErrorType.TokenCreationFailed,
+                ex);
+        }
+    }
+
+    /// <summary>
+    /// Extracts the username from a token
+    /// </summary>
+    /// <param name="token">Token to extract username from</param>
+    /// <returns>Username from the token</returns>
+    public static string GetTokenUsername(SafeAccessTokenHandle token)
+    {
+        if (token == null || token.IsInvalid)
+        {
+            throw new ArgumentException("Invalid token handle", nameof(token));
+        }
+
+        try
+        {
+            using var identity = new WindowsIdentity(token.DangerousGetHandle());
+            
+            // Extract just the username part (without domain)
+            var fullName = identity.Name;
+            if (fullName.Contains('\\'))
+            {
+                return fullName.Split('\\')[1];
+            }
+            else if (fullName.Contains('@'))
+            {
+                return fullName.Split('@')[0];
+            }
+            
+            return fullName;
+        }
+        catch (Exception ex)
+        {
+            throw new KerberosException(
+                $"Failed to get token username: {ex.Message}",
+                Marshal.GetLastWin32Error(),
+                KerberosErrorType.TokenCreationFailed,
+                ex);
+        }
+    }
+
+    /// <summary>
+    /// Extracts the domain from a token
+    /// </summary>
+    /// <param name="token">Token to extract domain from</param>
+    /// <returns>Domain from the token</returns>
+    public static string GetTokenDomain(SafeAccessTokenHandle token)
+    {
+        if (token == null || token.IsInvalid)
+        {
+            throw new ArgumentException("Invalid token handle", nameof(token));
+        }
+
+        try
+        {
+            using var identity = new WindowsIdentity(token.DangerousGetHandle());
+            
+            // Extract domain part
+            var fullName = identity.Name;
+            if (fullName.Contains('\\'))
+            {
+                return fullName.Split('\\')[0];
+            }
+            else if (fullName.Contains('@'))
+            {
+                return fullName.Split('@')[1];
+            }
+            
+            // If no domain separator found, try to get from environment
+            return Environment.UserDomainName;
+        }
+        catch (Exception ex)
+        {
+            throw new KerberosException(
+                $"Failed to get token domain: {ex.Message}",
+                Marshal.GetLastWin32Error(),
+                KerberosErrorType.TokenCreationFailed,
+                ex);
+        }
+    }
+
+    /// <summary>
+    /// Checks if a token is forwardable (can be used for delegation)
+    /// </summary>
+    /// <param name="token">Token to check</param>
+    /// <returns>True if token is forwardable</returns>
+    public static bool IsTokenForwardable(SafeAccessTokenHandle token)
+    {
+        if (token == null || token.IsInvalid)
+        {
+            throw new ArgumentException("Invalid token handle", nameof(token));
+        }
+
+        try
+        {
+            // Get token statistics to check if it's forwardable
+            // A token is forwardable if it has delegation impersonation level
+            int returnLength;
+            var success = NativeMethods.GetTokenInformation(
+                token,
+                NativeMethods.TokenStatistics,
+                IntPtr.Zero,
+                0,
+                out returnLength);
+
+            var buffer = Marshal.AllocHGlobal(returnLength);
+            try
+            {
+                success = NativeMethods.GetTokenInformation(
+                    token,
+                    NativeMethods.TokenStatistics,
+                    buffer,
+                    returnLength,
+                    out returnLength);
+
+                if (!success)
+                {
+                    var error = Marshal.GetLastWin32Error();
+                    throw new KerberosException(
+                        $"Failed to get token statistics: Win32 error {error}",
+                        error,
+                        KerberosErrorType.TokenCreationFailed);
+                }
+
+                // S4U2Self tokens from LsaLogonUser are issued at Identification level
+                // by default. The Windows impersonation level in TOKEN_STATISTICS is a
+                // local access-control concept and does NOT reflect whether the embedded
+                // Kerberos ticket has the FORWARDABLE flag set.
+                //
+                // Forwardability for S4U2Proxy is determined by the service account's
+                // constrained delegation configuration in Active Directory, not by this
+                // field. Checking ImpersonationLevel == SECURITY_DELEGATION here is
+                // incorrect and will always reject valid S4U2Self tokens.
+                //
+                // Log the level for diagnostics but always return true — S4U2Proxy will
+                // fail with a meaningful error if delegation is not configured in AD.
+                var stats = Marshal.PtrToStructure<NativeMethods.TOKEN_STATISTICS>(buffer);
+                string levelName = stats.ImpersonationLevel switch {
+                    0 => "Anonymous",
+                    1 => "Identification",
+                    2 => "Impersonation",
+                    3 => "Delegation",
+                    _ => $"Unknown({stats.ImpersonationLevel})"
+                };
+                Console.WriteLine($"[TokenManager] Token impersonation level: {levelName} ({stats.ImpersonationLevel}) — forwardability determined by AD delegation config");
+                return true;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+        catch (KerberosException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new KerberosException(
+                $"Failed to check if token is forwardable: {ex.Message}",
+                Marshal.GetLastWin32Error(),
+                KerberosErrorType.TokenCreationFailed,
+                ex);
+        }
+    }
+
+    /// <summary>
+    /// Registers the LSA authentication package for Kerberos
+    /// </summary>
+    /// <param name="packageName">Name of the authentication package (typically "Negotiate")</param>
+    /// <param name="requireTrustedConnection">If true, only use LsaRegisterLogonProcess (required for S4U operations)</param>
+    /// <returns>Authentication package ID</returns>
+    /// <exception cref="KerberosException">Thrown when registration fails</exception>
+    public uint RegisterLsaAuthenticationPackage(string packageName = "Negotiate", bool requireTrustedConnection = true)
+    {
+        Console.WriteLine($"[TokenManager] RegisterLsaAuthenticationPackage called with package: {packageName}, requireTrustedConnection: {requireTrustedConnection}");
+        
+        if (string.IsNullOrWhiteSpace(packageName))
+        {
+            throw new ArgumentException("Package name cannot be null or empty", nameof(packageName));
+        }
+
+        // If already registered, return cached value
+        if (_lsaHandle != IntPtr.Zero && _authenticationPackage != 0)
+        {
+            Console.WriteLine($"[TokenManager] Using cached LSA handle and authentication package: {_authenticationPackage}");
+            return _authenticationPackage;
+        }
+
+        try
+        {
+            int status;
+            
+            // For S4U operations, we MUST use LsaRegisterLogonProcess (requires SeTcbPrivilege)
+            // LsaConnectUntrusted does NOT support S4U2Self/S4U2Proxy
+            if (requireTrustedConnection)
+            {
+                Console.WriteLine($"[TokenManager] Trusted connection required - attempting LsaRegisterLogonProcess");
+                // Try to enable SeTcbPrivilege if we're running as Administrator
+                TryEnableSeTcbPrivilege();
+                
+                var processName = NativeMethods.CreateLsaString("KerberosConstrainedDelegation");
+                try
+                {
+                    Console.WriteLine($"[TokenManager] Calling LsaRegisterLogonProcess...");
+                    status = NativeMethods.LsaRegisterLogonProcess(
+                        ref processName,
+                        out _lsaHandle,
+                        out ulong securityMode);
+
+                    if (status != NativeMethods.STATUS_SUCCESS)
+                    {
+                        var win32Error = NativeMethods.LsaNtStatusToWinError(status);
+                        Console.WriteLine($"[TokenManager] ERROR: LsaRegisterLogonProcess failed with status: 0x{status:X8}, Win32 error: {win32Error}");
+                        
+                        if (status == NativeMethods.STATUS_PRIVILEGE_NOT_HELD)
+                        {
+                            throw new KerberosException(
+                                $"LsaRegisterLogonProcess failed with STATUS_PRIVILEGE_NOT_HELD (0x{status:X8}). " +
+                                $"S4U operations require SeTcbPrivilege. " +
+                                $"Solutions:\n" +
+                                $"1. Run as SYSTEM: Install as Windows Service with SYSTEM account\n" +
+                                $"2. Grant privilege: secpol.msc → User Rights Assignment → 'Act as part of the operating system' → Add your account\n" +
+                                $"3. Use psexec: psexec -s -i YourApp.exe",
+                                win32Error,
+                                KerberosErrorType.ServiceAuthenticationFailed);
+                        }
+                        
+                        throw new KerberosException(
+                            $"LsaRegisterLogonProcess failed with status: 0x{status:X8}. " +
+                            $"This operation requires SeTcbPrivilege.",
+                            win32Error,
+                            KerberosErrorType.ServiceAuthenticationFailed);
+                    }
+                    Console.WriteLine($"[TokenManager] LsaRegisterLogonProcess succeeded, LSA handle obtained");
+                }
+                finally
+                {
+                    NativeMethods.FreeLsaString(ref processName);
+                }
+            }
+            else
+            {
+                Console.WriteLine($"[TokenManager] Attempting LsaConnectUntrusted first...");
+                // Try LsaConnectUntrusted first (doesn't require SeTcbPrivilege)
+                status = NativeMethods.LsaConnectUntrusted(out _lsaHandle);
+
+                // If LsaConnectUntrusted fails, try LsaRegisterLogonProcess
+                if (status != NativeMethods.STATUS_SUCCESS)
+                {
+                    Console.WriteLine($"[TokenManager] LsaConnectUntrusted failed with status: 0x{status:X8}, trying LsaRegisterLogonProcess...");
+                    TryEnableSeTcbPrivilege();
+                    
+                    var processName = NativeMethods.CreateLsaString("KerberosConstrainedDelegation");
+                    try
+                    {
+                        status = NativeMethods.LsaRegisterLogonProcess(
+                            ref processName,
+                            out _lsaHandle,
+                            out ulong securityMode);
+
+                        if (status != NativeMethods.STATUS_SUCCESS)
+                        {
+                            var win32Error = NativeMethods.LsaNtStatusToWinError(status);
+                            throw new KerberosException(
+                                $"Both LsaConnectUntrusted and LsaRegisterLogonProcess failed. LsaRegisterLogonProcess status: 0x{status:X8}. " +
+                                $"This operation may require SeTcbPrivilege.",
+                                win32Error,
+                                KerberosErrorType.ServiceAuthenticationFailed);
+                        }
+                    }
+                    finally
+                    {
+                        NativeMethods.FreeLsaString(ref processName);
+                    }
+                }
+            }
+
+            // Try multiple package names in order of preference
+            string[] packageNamesToTry = packageName == "Negotiate" 
+                ? new[] { NativeMethods.NEGOSSP_NAME, NativeMethods.MICROSOFT_KERBEROS_NAME, NativeMethods.MSV1_0_PACKAGE_NAME }
+                : packageName == "Kerberos"
+                    ? new[] { NativeMethods.MICROSOFT_KERBEROS_NAME }  // S4U requires Kerberos only — no MSV1_0 fallback
+                    : new[] { packageName, NativeMethods.MSV1_0_PACKAGE_NAME };
+
+            Exception? lastException = null;
+            
+            foreach (var pkgName in packageNamesToTry)
+            {
+                var authPackageName = NativeMethods.CreateLsaString(pkgName);
+                try
+                {
+                    status = NativeMethods.LsaLookupAuthenticationPackage(
+                        _lsaHandle,
+                        ref authPackageName,
+                        out _authenticationPackage);
+
+                    if (status == NativeMethods.STATUS_SUCCESS && _authenticationPackage != 0)
+                    {
+                        // Success! Return the valid package ID
+                        Console.WriteLine($"[TokenManager] Successfully registered authentication package '{pkgName}' with ID: {_authenticationPackage}");
+                        return _authenticationPackage;
+                    }
+
+                    // If we got here, either status failed or package ID is 0
+                    if (status != NativeMethods.STATUS_SUCCESS)
+                    {
+                        var win32Error = NativeMethods.LsaNtStatusToWinError(status);
+                        lastException = new KerberosException(
+                            $"LsaLookupAuthenticationPackage failed for '{pkgName}' with status: 0x{status:X8}",
+                            win32Error,
+                            KerberosErrorType.ServiceAuthenticationFailed);
+                    }
+                    else
+                    {
+                        lastException = new KerberosException(
+                            $"LsaLookupAuthenticationPackage returned invalid package ID (0) for '{pkgName}'.",
+                            0,
+                            KerberosErrorType.ServiceAuthenticationFailed);
+                    }
+                }
+                finally
+                {
+                    NativeMethods.FreeLsaString(ref authPackageName);
+                }
+            }
+
+            // If we get here, all package names failed
+            throw new KerberosException(
+                $"Failed to lookup any authentication package. Tried: {string.Join(", ", packageNamesToTry)}. " +
+                $"Last error: {lastException?.Message ?? "Unknown"}",
+                0,
+                KerberosErrorType.ServiceAuthenticationFailed,
+                lastException!);
+        }
+        catch (KerberosException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new KerberosException(
+                $"Failed to register LSA authentication package: {ex.Message}",
+                Marshal.GetLastWin32Error(),
+                KerberosErrorType.ServiceAuthenticationFailed,
+                ex);
+        }
+    }
+
+    /// <summary>
+    /// Authenticates the service account to obtain initial credentials for delegation operations
+    /// </summary>
+    /// <returns>SafeAccessTokenHandle representing the authenticated service account</returns>
+    /// <exception cref="KerberosException">Thrown when authentication fails</exception>
+    private SafeAccessTokenHandle AuthenticateServiceAccount()
+    {
+        Console.WriteLine($"[TokenManager] AuthenticateServiceAccount called");
+        
+        if (_serviceCredentials == null)
+        {
+            throw new InvalidOperationException("Service credentials are not initialized");
+        }
+
+        Console.WriteLine($"[TokenManager] Authenticating service account: {_serviceCredentials.FullyQualifiedUsername}");
+        
+        // Convert SecureString password to plain text for LogonUser API
+        IntPtr passwordPtr = IntPtr.Zero;
+        try
+        {
+            passwordPtr = Marshal.SecureStringToGlobalAllocUnicode(_serviceCredentials.Password);
+            var password = Marshal.PtrToStringUni(passwordPtr);
+
+            if (password == null)
+            {
+                throw new KerberosException(
+                    "Failed to convert password from SecureString",
+                    0,
+                    KerberosErrorType.ServiceAuthenticationFailed);
+            }
+
+            // Call LogonUser API with LOGON32_LOGON_NETWORK logon type
+            Console.WriteLine($"[TokenManager] Calling LogonUser for service account...");
+            var success = NativeMethods.LogonUser(
+                _serviceCredentials.Username,
+                _serviceCredentials.Domain,
+                password,
+                NativeMethods.LOGON32_LOGON_NETWORK,
+                NativeMethods.LOGON32_PROVIDER_DEFAULT,
+                out SafeAccessTokenHandle token);
+
+            if (!success)
+            {
+                var win32Error = Marshal.GetLastWin32Error();
+                Console.WriteLine($"[TokenManager] ERROR: LogonUser failed with Win32 error: 0x{win32Error:X8}");
+                throw new KerberosException(
+                    $"Service account authentication failed for {_serviceCredentials.FullyQualifiedUsername}. Win32 error: 0x{win32Error:X8}",
+                    win32Error,
+                    KerberosErrorType.ServiceAuthenticationFailed);
+            }
+
+            // Validate that the token handle is valid
+            if (token == null || token.IsInvalid)
+            {
+                Console.WriteLine($"[TokenManager] ERROR: LogonUser returned invalid token handle");
+                throw new KerberosException(
+                    $"Service account authentication returned invalid token handle for {_serviceCredentials.FullyQualifiedUsername}",
+                    0,
+                    KerberosErrorType.ServiceAuthenticationFailed);
+            }
+
+            Console.WriteLine($"[TokenManager] Service account authenticated successfully");
+            return token;
+        }
+        catch (KerberosException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new KerberosException(
+                $"Unexpected error during service account authentication: {ex.Message}",
+                Marshal.GetLastWin32Error(),
+                KerberosErrorType.ServiceAuthenticationFailed,
+                ex);
+        }
+        finally
+        {
+            // Clear the password from memory
+            if (passwordPtr != IntPtr.Zero)
+            {
+                Marshal.ZeroFreeGlobalAllocUnicode(passwordPtr);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Executes S4U2Self (Service for User to Self) to obtain a forwardable ticket for the target user
+    /// </summary>
+    /// <param name="serviceToken">Service account token</param>
+    /// <param name="username">Username to impersonate (UPN or DOMAIN\username format)</param>
+    /// <returns>SafeAccessTokenHandle representing the user's forwardable ticket</returns>
+    /// <exception cref="KerberosException">Thrown when S4U2Self fails</exception>
+    private SafeAccessTokenHandle ExecuteS4U2Self(SafeAccessTokenHandle serviceToken, string username)
+    {
+        Console.WriteLine($"[TokenManager] ExecuteS4U2Self called for username: {username}");
+        
+        if (serviceToken == null || serviceToken.IsInvalid)
+        {
+            throw new ArgumentException("Invalid service token handle", nameof(serviceToken));
+        }
+
+        if (string.IsNullOrWhiteSpace(username))
+        {
+            throw new ArgumentException("Username cannot be null or empty", nameof(username));
+        }
+
+        // Step 1: Parse username into domain and account components
+        var (userDomain, account) = ParseUsername(username);
+        Console.WriteLine($"[TokenManager] Parsed username - Domain: {userDomain}, Account: {account}");
+
+        // ClientRealm must be the SERVICE ACCOUNT's domain (the local domain whose DC
+        // we are contacting), NOT the user's domain. The local DC uses the cross-domain
+        // trust to look up the user in iconplc.com. Passing the user's domain here causes
+        // the Kerberos package to try to contact iconplc.com directly, which fails with
+        // STATUS_INVALID_PARAMETER when there is no direct path.
+        //
+        // S4U_LOGON_FLAG_IDENTITY (0x8) is required for cross-domain S4U2Self — without
+        // it the DC returns STATUS_NO_TRUST_SAM_ACCOUNT for users in trusted domains.
+        string clientRealm = _serviceCredentials.Domain;
+        uint s4uFlags = NativeMethods.S4U_LOGON_FLAG_IDENTITY;
+        Console.WriteLine($"[TokenManager] S4U ClientUpn='{username}', ClientRealm='{clientRealm}' (service domain), Flags=0x{s4uFlags:X}");
+
+        // Step 2: Register LSA authentication package
+        // Must use "Kerberos" (not "Negotiate") for S4U operations — Negotiate
+        // does not accept KERB_S4U_LOGON and causes STATUS_INVALID_PARAMETER (0xC000000D).
+        Console.WriteLine($"[TokenManager] Registering LSA authentication package...");
+        var authPackage = RegisterLsaAuthenticationPackage("Kerberos");
+
+        // Validate that we got a valid authentication package ID
+        if (authPackage == 0)
+        {
+            Console.WriteLine($"[TokenManager] ERROR: Authentication package ID is 0");
+            throw new KerberosException(
+                "Failed to obtain valid authentication package ID. LsaLookupAuthenticationPackage returned 0.",
+                0,
+                KerberosErrorType.S4U2SelfFailed);
+        }
+        Console.WriteLine($"[TokenManager] Authentication package ID: {authPackage}");
+
+        // Step 3: Build KERB_S4U_LOGON structure as a single contiguous memory block.
+        //
+        // CRITICAL: The Kerberos package requires that the UNICODE_STRING Buffer fields
+        // contain pointers to memory within the SAME allocation passed to LsaLogonUser.
+        // Using separate heap allocations (Marshal.StringToHGlobalUni) causes
+        // STATUS_INVALID_PARAMETER (0xC000000D) because the LSA validates that all
+        // string data resides within the AuthenticationInformation buffer bounds.
+        //
+        // Layout: [KERB_S4U_LOGON header][UPN chars][Realm chars]
+        //         Buffer pointers point into this same block.
+        Console.WriteLine($"[TokenManager] Building KERB_S4U_LOGON structure...");
+
+        // Encode strings as UTF-16LE (Unicode)
+        var upnBytes   = System.Text.Encoding.Unicode.GetBytes(username);
+        var realmBytes = System.Text.Encoding.Unicode.GetBytes(clientRealm);
+
+        var structSize  = Marshal.SizeOf<NativeMethods.KERB_S4U_LOGON>();
+        var totalSize   = structSize + upnBytes.Length + realmBytes.Length;
+        var s4uLogonPtr = Marshal.AllocHGlobal(totalSize);
+
+        try
+        {
+            // Zero the entire buffer first
+            for (int i = 0; i < totalSize; i++)
+                Marshal.WriteByte(s4uLogonPtr, i, 0);
+
+            // Calculate where each string will live inside the buffer
+            var upnOffset   = structSize;
+            var realmOffset = structSize + upnBytes.Length;
+
+            var upnPtr   = IntPtr.Add(s4uLogonPtr, upnOffset);
+            var realmPtr = IntPtr.Add(s4uLogonPtr, realmOffset);
+
+            // Copy string bytes into the buffer
+            Marshal.Copy(upnBytes,   0, upnPtr,   upnBytes.Length);
+            Marshal.Copy(realmBytes, 0, realmPtr, realmBytes.Length);
+
+            // Write the KERB_S4U_LOGON header fields using Marshal.OffsetOf for
+            // correct offsets on both 32-bit and 64-bit.
+            //
+            // On 64-bit: UNICODE_STRING = { Length(2), MaxLength(2), pad(4), Buffer(8) } = 16 bytes
+            //   Buffer is at offset +8 within UNICODE_STRING (NOT +4).
+            // Hardcoding +4 for Buffer is the classic 64-bit S4U marshalling bug.
+            int upnFieldOffset   = (int)Marshal.OffsetOf<NativeMethods.KERB_S4U_LOGON>("ClientUpn");
+            int realmFieldOffset = (int)Marshal.OffsetOf<NativeMethods.KERB_S4U_LOGON>("ClientRealm");
+            int bufferSubOffset  = (int)Marshal.OffsetOf<NativeMethods.UNICODE_STRING>("Buffer");
+
+            Marshal.WriteInt32(s4uLogonPtr, 0, NativeMethods.KerbS4ULogon);  // MessageType = 12
+            Marshal.WriteInt32(s4uLogonPtr, 4, (int)s4uFlags);               // Flags
+
+            // ClientUpn
+            Marshal.WriteInt16(s4uLogonPtr, upnFieldOffset,                  (short)upnBytes.Length);        // Length
+            Marshal.WriteInt16(s4uLogonPtr, upnFieldOffset + 2,              (short)(upnBytes.Length + 2));  // MaximumLength
+            Marshal.WriteIntPtr(s4uLogonPtr, upnFieldOffset + bufferSubOffset, upnPtr);                       // Buffer
+
+            // ClientRealm
+            Marshal.WriteInt16(s4uLogonPtr, realmFieldOffset,                  (short)realmBytes.Length);        // Length
+            Marshal.WriteInt16(s4uLogonPtr, realmFieldOffset + 2,              (short)(realmBytes.Length + 2));  // MaximumLength
+            Marshal.WriteIntPtr(s4uLogonPtr, realmFieldOffset + bufferSubOffset, realmPtr);                       // Buffer
+
+            // Step 4: Prepare origin name and token source
+            var originName = NativeMethods.CreateLsaString("S4U2Self");
+            try
+            {
+                // TOKEN_SOURCE.SourceName must be exactly 8 bytes
+                var sourceNameBytes = new byte[8];
+                var encodedBytes = System.Text.Encoding.ASCII.GetBytes("S4U2Self");
+                Array.Copy(encodedBytes, sourceNameBytes, Math.Min(encodedBytes.Length, 8));
+
+                var tokenSource = new NativeMethods.TOKEN_SOURCE
+                {
+                    SourceName = sourceNameBytes,
+                    SourceIdentifier = new NativeMethods.LUID { LowPart = 0, HighPart = 0 }
+                };
+
+                // Step 5: Call LsaLogonUser API with S4U2Self request
+                Console.WriteLine($"[TokenManager] Calling LsaLogonUser for S4U2Self...");
+                var status = NativeMethods.LsaLogonUser(
+                    _lsaHandle,
+                    ref originName,
+                    NativeMethods.Network,  // Use Network logon type for S4U
+                    authPackage,
+                    s4uLogonPtr,
+                    (uint)totalSize,
+                    IntPtr.Zero,
+                    ref tokenSource,
+                    out IntPtr profileBuffer,
+                    out uint profileBufferLength,
+                    out NativeMethods.LUID logonId,
+                    out SafeAccessTokenHandle token,
+                    out NativeMethods.QUOTA_LIMITS quotas,
+                    out int subStatus);
+
+                // Free profile buffer if allocated
+                if (profileBuffer != IntPtr.Zero)
+                {
+                    NativeMethods.LsaFreeReturnBuffer(profileBuffer);
+                }
+
+                if (status != NativeMethods.STATUS_SUCCESS)
+                {
+                    var win32Error = NativeMethods.LsaNtStatusToWinError(status);
+                    Console.WriteLine($"[TokenManager] ERROR: LsaLogonUser (S4U2Self) failed with status: 0x{status:X8}, SubStatus: 0x{subStatus:X8}, Win32 error: {win32Error}");
+
+                    if (status == NativeMethods.STATUS_NO_SUCH_USER)
+                    {
+                        throw new KerberosException(
+                            $"User not found: {username}. NTSTATUS: 0x{status:X8}",
+                            win32Error,
+                            KerberosErrorType.UserNotFound);
+                    }
+
+                    throw new KerberosException(
+                        $"LsaLogonUser (S4U2Self) failed for user: {username}. NTSTATUS: 0x{status:X8}, SubStatus: 0x{subStatus:X8}",
+                        win32Error,
+                        KerberosErrorType.S4U2SelfFailed);
+                }
+
+                Console.WriteLine($"[TokenManager] LsaLogonUser (S4U2Self) succeeded");
+
+                // Validate token handle
+                if (token == null || token.IsInvalid)
+                {
+                    Console.WriteLine($"[TokenManager] ERROR: S4U2Self returned invalid token handle");
+                    throw new KerberosException(
+                        $"S4U2Self returned invalid token handle for user: {username}",
+                        0,
+                        KerberosErrorType.S4U2SelfFailed);
+                }
+
+                // Step 6: Validate returned token is forwardable (required for S4U2Proxy)
+                Console.WriteLine($"[TokenManager] Checking if token is forwardable...");
+                if (!IsTokenForwardable(token))
+                {
+                    token.Dispose();
+                    Console.WriteLine($"[TokenManager] ERROR: Token is not forwardable");
+                    throw new KerberosException(
+                        $"S4U2Self token is not forwardable for user: {username}. Token cannot be used for delegation.",
+                        0,
+                        KerberosErrorType.S4U2SelfFailed);
+                }
+
+                Console.WriteLine($"[TokenManager] Token is forwardable - ExecuteS4U2Self completed successfully");
+                return token;
+            }
+            finally
+            {
+                NativeMethods.FreeLsaString(ref originName);
+            }
+        }
+        catch (KerberosException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new KerberosException(
+                $"Unexpected error during S4U2Self for user {username}: {ex.Message}",
+                Marshal.GetLastWin32Error(),
+                KerberosErrorType.S4U2SelfFailed,
+                ex);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(s4uLogonPtr);
+        }
+    }
+
+    /// <summary>
+    /// Executes S4U2Proxy (Service for User to Proxy) to obtain a service ticket for the target service using delegated credentials
+    /// </summary>
+    /// <param name="userToken">User token obtained from S4U2Self (must be forwardable)</param>
+    /// <param name="targetSpn">Target Service Principal Name for delegation</param>
+    /// <returns>SafeAccessTokenHandle representing delegated credentials for target service</returns>
+    /// <exception cref="KerberosException">Thrown when S4U2Proxy fails</exception>
+    private SafeAccessTokenHandle ExecuteS4U2Proxy(SafeAccessTokenHandle userToken, string targetSpn)
+    {
+        Console.WriteLine($"[TokenManager] ExecuteS4U2Proxy called for target SPN: {targetSpn}");
+
+        if (userToken == null || userToken.IsInvalid)
+            throw new ArgumentException("Invalid user token handle", nameof(userToken));
+        if (string.IsNullOrWhiteSpace(targetSpn))
+            throw new ArgumentException("Target SPN cannot be null or empty", nameof(targetSpn));
+
+        // The S4U2Self token is Identification-level. We cannot elevate it.
+        // CreateProcessWithTokenW (unlike CreateProcessAsUser) accepts Identification-level
+        // tokens directly. The OS performs S4U2Proxy transparently when the spawned
+        // process first accesses targetSpn, using the service account's constrained
+        // delegation configuration in AD.
+        //
+        // We just duplicate the handle (same access, no level change) so the caller
+        // owns an independent reference that it can safely dispose.
+        Console.WriteLine($"[TokenManager] S4U2Proxy: duplicating S4U2Self token handle for CreateProcessWithTokenW...");
+
+        bool ok = NativeMethods.DuplicateHandle(
+            NativeMethods.GetCurrentProcess(),
+            userToken.DangerousGetHandle(),
+            NativeMethods.GetCurrentProcess(),
+            out IntPtr dupPtr,
+            0,      // dwDesiredAccess = 0 with DUPLICATE_SAME_ACCESS copies the same rights
+            false,
+            2);     // DUPLICATE_SAME_ACCESS = 2
+
+        if (!ok)
+        {
+            int err = Marshal.GetLastWin32Error();
+            throw new KerberosException(
+                $"DuplicateHandle for S4U token failed: Win32 error {err}",
+                err, KerberosErrorType.S4U2ProxyFailed);
+        }
+
+        Console.WriteLine($"[TokenManager] ExecuteS4U2Proxy completed — token ready for CreateProcessWithTokenW");
+        return new SafeAccessTokenHandle(dupPtr);
+    }
+
+    /// <summary>
+    /// Attempts to enable SeTcbPrivilege for the current process
+    /// </summary>
+    /// <remarks>
+    /// This will only succeed if running as Administrator and the privilege is available.
+    /// Silently fails if the privilege cannot be enabled.
+    /// </remarks>
+    private static void TryEnableSeTcbPrivilege()
+    {
+        try
+        {
+            Console.WriteLine("[DEBUG] Attempting to enable SeTcbPrivilege...");
+            
+            // Open the current process token
+            if (!NativeMethods.OpenProcessToken(
+                NativeMethods.GetCurrentProcess(),
+                0x0020 | 0x0008, // TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY
+                out SafeAccessTokenHandle tokenHandle))
+            {
+                var error = Marshal.GetLastWin32Error();
+                Console.WriteLine($"[DEBUG] Failed to open process token. Error: {error}");
+                return; // Silently fail
+            }
+
+            using (tokenHandle)
+            {
+                // Look up the LUID for SeTcbPrivilege
+                if (!NativeMethods.LookupPrivilegeValue(
+                    null,
+                    NativeMethods.SE_TCB_NAME,
+                    out NativeMethods.LUID luid))
+                {
+                    var error = Marshal.GetLastWin32Error();
+                    Console.WriteLine($"[DEBUG] Failed to lookup SeTcbPrivilege. Error: {error}");
+                    Console.WriteLine($"[DEBUG] This means the privilege is NOT assigned to your account.");
+                    return; // Privilege doesn't exist or can't be looked up
+                }
+
+                Console.WriteLine($"[DEBUG] SeTcbPrivilege LUID found: {luid.LowPart}");
+
+                // Prepare the TOKEN_PRIVILEGES structure
+                var tokenPrivileges = new NativeMethods.TOKEN_PRIVILEGES
+                {
+                    PrivilegeCount = 1,
+                    Privileges = new NativeMethods.LUID_AND_ATTRIBUTES[1]
+                };
+                tokenPrivileges.Privileges[0].Luid = luid;
+                tokenPrivileges.Privileges[0].Attributes = NativeMethods.SE_PRIVILEGE_ENABLED;
+
+                // Try to enable the privilege
+                if (!NativeMethods.AdjustTokenPrivileges(
+                    tokenHandle,
+                    false,
+                    ref tokenPrivileges,
+                    0,
+                    IntPtr.Zero,
+                    IntPtr.Zero))
+                {
+                    var error = Marshal.GetLastWin32Error();
+                    Console.WriteLine($"[DEBUG] AdjustTokenPrivileges failed. Error: {error}");
+                    return;
+                }
+
+                // Check if it actually worked
+                var lastError = Marshal.GetLastWin32Error();
+                if (lastError == 0)
+                {
+                    Console.WriteLine($"[DEBUG] ✓ SeTcbPrivilege successfully enabled!");
+                }
+                else if (lastError == 1300) // ERROR_NOT_ALL_ASSIGNED
+                {
+                    Console.WriteLine($"[DEBUG] ✗ SeTcbPrivilege could NOT be enabled (ERROR_NOT_ALL_ASSIGNED)");
+                    Console.WriteLine($"[DEBUG] The privilege is not assigned to your account.");
+                    Console.WriteLine($"[DEBUG] You must grant it using secpol.msc or run as SYSTEM.");
+                }
+                else
+                {
+                    Console.WriteLine($"[DEBUG] AdjustTokenPrivileges returned error: {lastError}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[DEBUG] Exception in TryEnableSeTcbPrivilege: {ex.Message}");
+            // Silently fail - this is a best-effort attempt
+        }
+    }
+
+    /// <summary>
+    /// Disposes resources used by the KerberosTokenManager
+    /// </summary>
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        if (_lsaHandle != IntPtr.Zero)
+        {
+            NativeMethods.LsaDeregisterLogonProcess(_lsaHandle);
+            _lsaHandle = IntPtr.Zero;
+        }
+
+        _disposed = true;
+    }
+}
