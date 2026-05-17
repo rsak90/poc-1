@@ -1098,13 +1098,16 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
             impersonating = true;
             _logger.Information("[TokenManager] S4U2Proxy: impersonation active on current thread");
 
-            // Step 2: Open the thread's impersonation token (Impersonation-level)
-            // TOKEN_ALL_ACCESS so we can duplicate it in step 3.
-            // OpenAsSelf=false means open under the impersonated identity.
+            // Step 2: Open the thread's impersonation token (Impersonation-level).
+            // OpenAsSelf=true is critical here — it opens the thread token using the
+            // process's primary token security context, not the impersonated identity.
+            // With OpenAsSelf=false and an Identification-level impersonation token,
+            // OpenThreadToken fails with 1346 because Identification doesn't allow
+            // the impersonated identity to open its own thread token.
             if (!NativeMethods.OpenThreadToken(
                     NativeMethods.GetCurrentThread(),
                     TOKEN_ALL_ACCESS,
-                    false,
+                    true,               // OpenAsSelf=true — use process context, not impersonated
                     out threadToken)
                 || threadToken == null || threadToken.IsInvalid)
             {
