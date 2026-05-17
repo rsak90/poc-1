@@ -942,12 +942,15 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
                     SourceIdentifier = new NativeMethods.LUID { LowPart = 0, HighPart = 0 }
                 };
 
-                // Step 5: Call LsaLogonUser API with S4U2Self request
-                _logger.Information("[TokenManager] Calling LsaLogonUser for S4U2Self...");
+                // Step 5: Call LsaLogonUser API with S4U2Self request.
+                // Network (3) is the correct logon type for S4U — the token level
+                // (Identification) is handled in ExecuteS4U2Proxy via the
+                // Impersonate → OpenThreadToken → DuplicateTokenEx pattern.
+                _logger.Information("[TokenManager] Calling LsaLogonUser for S4U2Self (logon type: Network)...");
                 var status = NativeMethods.LsaLogonUser(
                     _lsaHandle,
                     ref originName,
-                    NativeMethods.Network,  // Use Network logon type for S4U
+                    NativeMethods.Network,
                     authPackage,
                     s4uLogonPtr,
                     (uint)totalSize,
@@ -1040,9 +1043,9 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
     /// <summary>
     /// Executes S4U2Proxy (Service for User to Proxy) to obtain a service ticket for the target service using delegated credentials
     /// </summary>
-    /// <param name="userToken">User token obtained from S4U2Self (must be forwardable)</param>
+    /// <param name="userToken">User token obtained from S4U2Self (Identification-level)</param>
     /// <param name="targetSpn">Target Service Principal Name for delegation</param>
-    /// <returns>SafeAccessTokenHandle representing delegated credentials for target service</returns>
+    /// <returns>Primary SafeAccessTokenHandle suitable for CreateProcessWithTokenW</returns>
     /// <exception cref="KerberosException">Thrown when S4U2Proxy fails</exception>
     private SafeAccessTokenHandle ExecuteS4U2Proxy(SafeAccessTokenHandle userToken, string targetSpn)
     {
@@ -1053,46 +1056,102 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
         if (string.IsNullOrWhiteSpace(targetSpn))
             throw new ArgumentException("Target SPN cannot be null or empty", nameof(targetSpn));
 
-        // S4U2Self returns an Identification-level token.
-        // CreateProcessWithTokenW requires at minimum Impersonation level — passing an
-        // Identification-level token causes ERROR_BAD_IMPERSONATION_LEVEL (1346).
+        // LsaLogonUser with KERB_S4U_LOGON always returns an Identification-level token
+        // regardless of logon type — this is a Windows security constraint, not a bug.
+        // Identification tokens cannot be used with CreateProcessWithTokenW (error 1346).
         //
-        // DuplicateTokenEx lets us promote the level while also converting the token
-        // type to Primary, which is what CreateProcessWithTokenW actually needs.
+        // The correct pattern to get a usable Primary token from an Identification token:
         //
-        // TOKEN_ALL_ACCESS (0x000F01FF) gives the new token full rights so the spawned
-        // process can open its own token for identity queries.
+        //   1. ImpersonateLoggedOnUser  — sets the S4U identity on the current thread.
+        //                                 This works even with Identification-level tokens
+        //                                 when the caller holds SeTcbPrivilege.
+        //   2. OpenThreadToken          — retrieves the thread's impersonation token,
+        //                                 which is Impersonation-level (not Identification).
+        //   3. DuplicateTokenEx         — converts the Impersonation token to a Primary
+        //                                 token, which CreateProcessWithTokenW requires.
+        //   4. RevertToSelf             — removes the impersonation from the thread.
         //
-        // The service account must hold SeImpersonatePrivilege (granted by default to
-        // services) for this call to succeed. SeTcbPrivilege is NOT required here.
-        _logger.Information("[TokenManager] S4U2Proxy: promoting S4U2Self token to Primary/Impersonation via DuplicateTokenEx...");
+        // No logoff/login or AD changes are needed. SeTcbPrivilege (already granted) is
+        // sufficient for step 1.
 
-        const int TOKEN_ALL_ACCESS       = 0x000F01FF;
-        const int SecurityImpersonation  = 2;   // SECURITY_IMPERSONATION_LEVEL
-        const int TokenPrimary           = 1;   // TOKEN_TYPE — required by CreateProcessWithTokenW
+        const uint TOKEN_ALL_ACCESS     = 0x000F01FF;
+        const int  SecurityImpersonation = 2;
+        const int  TokenPrimary          = 1;
 
-        bool ok = NativeMethods.DuplicateTokenEx(
-            userToken,
-            TOKEN_ALL_ACCESS,
-            IntPtr.Zero,            // default security attributes
-            SecurityImpersonation,  // promote from Identification → Impersonation
-            TokenPrimary,           // CreateProcessWithTokenW requires a Primary token
-            out SafeAccessTokenHandle primaryToken);
+        SafeAccessTokenHandle? threadToken  = null;
+        SafeAccessTokenHandle? primaryToken = null;
+        bool impersonating = false;
 
-        if (!ok || primaryToken == null || primaryToken.IsInvalid)
+        try
         {
-            int err = Marshal.GetLastWin32Error();
-            _logger.Error("[TokenManager] DuplicateTokenEx failed: Win32 {Win32Error} (0x{Win32ErrorHex:X8}). " +
-                          "Ensure the service account has SeImpersonatePrivilege.", err, err);
-            throw new KerberosException(
-                $"DuplicateTokenEx failed promoting S4U token to Primary level. Win32 error: {err} (0x{err:X8}). " +
-                $"Ensure the service account has SeImpersonatePrivilege.",
-                err, KerberosErrorType.S4U2ProxyFailed);
-        }
+            // Step 1: Impersonate the S4U user on the current thread
+            _logger.Information("[TokenManager] S4U2Proxy: calling ImpersonateLoggedOnUser...");
+            if (!NativeMethods.ImpersonateLoggedOnUser(userToken))
+            {
+                int err = Marshal.GetLastWin32Error();
+                _logger.Error("[TokenManager] ImpersonateLoggedOnUser failed: Win32 {Win32Error} (0x{Win32ErrorHex:X8})", err, err);
+                throw new KerberosException(
+                    $"ImpersonateLoggedOnUser failed. Win32 error: {err} (0x{err:X8}). " +
+                    $"Ensure the service account has SeTcbPrivilege.",
+                    err, KerberosErrorType.S4U2ProxyFailed);
+            }
+            impersonating = true;
+            _logger.Information("[TokenManager] S4U2Proxy: impersonation active on current thread");
 
-        _logger.Information("[TokenManager] ExecuteS4U2Proxy completed — Primary token ready for CreateProcessWithTokenW");
-        LogTokenInfo("S4U2Proxy", primaryToken);
-        return primaryToken;
+            // Step 2: Open the thread's impersonation token (Impersonation-level)
+            // TOKEN_ALL_ACCESS so we can duplicate it in step 3.
+            // OpenAsSelf=false means open under the impersonated identity.
+            if (!NativeMethods.OpenThreadToken(
+                    NativeMethods.GetCurrentThread(),
+                    TOKEN_ALL_ACCESS,
+                    false,
+                    out threadToken)
+                || threadToken == null || threadToken.IsInvalid)
+            {
+                int err = Marshal.GetLastWin32Error();
+                _logger.Error("[TokenManager] OpenThreadToken failed: Win32 {Win32Error} (0x{Win32ErrorHex:X8})", err, err);
+                throw new KerberosException(
+                    $"OpenThreadToken failed. Win32 error: {err} (0x{err:X8}).",
+                    err, KerberosErrorType.S4U2ProxyFailed);
+            }
+            _logger.Information("[TokenManager] S4U2Proxy: thread impersonation token obtained");
+
+            // Step 3: Duplicate to a Primary token for CreateProcessWithTokenW
+            if (!NativeMethods.DuplicateTokenEx(
+                    threadToken,
+                    (int)TOKEN_ALL_ACCESS,
+                    IntPtr.Zero,
+                    SecurityImpersonation,
+                    TokenPrimary,
+                    out primaryToken)
+                || primaryToken == null || primaryToken.IsInvalid)
+            {
+                int err = Marshal.GetLastWin32Error();
+                _logger.Error("[TokenManager] DuplicateTokenEx failed: Win32 {Win32Error} (0x{Win32ErrorHex:X8})", err, err);
+                throw new KerberosException(
+                    $"DuplicateTokenEx failed. Win32 error: {err} (0x{err:X8}).",
+                    err, KerberosErrorType.S4U2ProxyFailed);
+            }
+
+            _logger.Information("[TokenManager] ExecuteS4U2Proxy completed — Primary token ready for CreateProcessWithTokenW");
+            LogTokenInfo("S4U2Proxy", primaryToken);
+            return primaryToken;
+        }
+        catch
+        {
+            primaryToken?.Dispose();
+            throw;
+        }
+        finally
+        {
+            // Step 4: Always revert impersonation before leaving, even on failure
+            if (impersonating)
+            {
+                NativeMethods.RevertToSelf();
+                _logger.Information("[TokenManager] S4U2Proxy: thread impersonation reverted");
+            }
+            threadToken?.Dispose();
+        }
     }
 
     /// <summary>

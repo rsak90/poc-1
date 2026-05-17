@@ -443,6 +443,22 @@ internal static class NativeMethods
     public static extern bool RevertToSelf();
 
     /// <summary>
+    /// Opens the access token associated with the current thread (impersonation token)
+    /// </summary>
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool OpenThreadToken(
+        IntPtr ThreadHandle,
+        uint DesiredAccess,
+        bool OpenAsSelf,
+        out SafeAccessTokenHandle TokenHandle);
+
+    /// <summary>
+    /// Returns a pseudo-handle for the current thread
+    /// </summary>
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetCurrentThread();
+
+    /// <summary>
     /// Retrieves information about the specified access token
     /// </summary>
     [DllImport("advapi32.dll", SetLastError = true)]
