@@ -221,25 +221,31 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
 
         try
         {
-            // Get the token username
+            // Get the token account name (without domain) for comparison.
+            // We compare only the account/username portion because the domain
+            // returned by WindowsIdentity.Name is always the NetBIOS name
+            // (e.g. "CONTOSO"), while ParseUsername on a UPN returns the FQDN
+            // (e.g. "contoso.com"). Comparing full "domain\user" strings across
+            // these two formats always fails even when the identity is correct.
             var tokenUsername = GetTokenUsername(token);
-            var tokenDomain = GetTokenDomain(token);
-            var fullTokenUsername = $"{tokenDomain}\\{tokenUsername}";
+            var (_, expectedAccount) = ParseUsername(expectedUsername);
 
-            // Parse expected username
-            var (expectedDomain, expectedAccount) = ParseUsername(expectedUsername);
-            var fullExpectedUsername = $"{expectedDomain}\\{expectedAccount}";
+            Console.WriteLine($"[TokenManager] ValidateToken: token account='{tokenUsername}', expected account='{expectedAccount}'");
 
-            // Compare usernames (case-insensitive)
-            if (!string.Equals(fullTokenUsername, fullExpectedUsername, StringComparison.OrdinalIgnoreCase))
+            // Compare only the account name (case-insensitive)
+            if (!string.Equals(tokenUsername, expectedAccount, StringComparison.OrdinalIgnoreCase))
             {
+                var tokenDomain = GetTokenDomain(token);
                 throw new KerberosException(
-                    $"Token username mismatch. Expected: {fullExpectedUsername}, Got: {fullTokenUsername}",
+                    $"Token username mismatch. Expected account: {expectedAccount}, Got: {tokenDomain}\\{tokenUsername}",
                     0,
                     KerberosErrorType.TokenCreationFailed);
             }
 
-            // Validate authentication type using WindowsIdentity
+            // Validate authentication type using WindowsIdentity.
+            // S4U tokens obtained via LsaLogonUser report AuthenticationType as
+            // "S4U" or "Negotiate" — never "Kerberos". Accept all three so that
+            // valid S4U tokens are not incorrectly rejected.
             using var identity = new WindowsIdentity(token.DangerousGetHandle());
             
             if (!identity.IsAuthenticated)
@@ -250,11 +256,18 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
                     KerberosErrorType.TokenCreationFailed);
             }
 
-            // Check if authentication type is Kerberos
-            if (!string.Equals(identity.AuthenticationType, "Kerberos", StringComparison.OrdinalIgnoreCase))
+            var authType = identity.AuthenticationType ?? string.Empty;
+            Console.WriteLine($"[TokenManager] ValidateToken: AuthenticationType='{authType}'");
+
+            bool isValidAuthType =
+                string.Equals(authType, "Kerberos",  StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(authType, "S4U",       StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(authType, "Negotiate", StringComparison.OrdinalIgnoreCase);
+
+            if (!isValidAuthType)
             {
                 throw new KerberosException(
-                    $"Token authentication type is not Kerberos: {identity.AuthenticationType}",
+                    $"Unexpected token authentication type: '{authType}'. Expected Kerberos, S4U, or Negotiate.",
                     0,
                     KerberosErrorType.TokenCreationFailed);
             }
