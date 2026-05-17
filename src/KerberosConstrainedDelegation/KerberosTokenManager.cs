@@ -1041,12 +1041,10 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
     }
 
     /// <summary>
-    /// Executes S4U2Proxy: converts the Identification-level S4U token into a
-    /// Primary token that CreateProcessAsUser can accept.
-    ///
-    /// With SeTcbPrivilege held and enabled, DuplicateTokenEx can promote an
-    /// Identification token directly to Primary/Impersonation. The privilege must
-    /// be explicitly enabled in the process token — being granted is not enough.
+    /// Executes S4U2Proxy: enables the required privileges and returns the S4U token
+    /// directly. CreateProcessAsUser handles the Primary token conversion internally
+    /// when SeTcbPrivilege + SeAssignPrimaryTokenPrivilege + SeIncreaseQuotaPrivilege
+    /// are held — no DuplicateTokenEx needed or possible on an S4U Identification token.
     /// </summary>
     private SafeAccessTokenHandle ExecuteS4U2Proxy(SafeAccessTokenHandle userToken, string targetSpn)
     {
@@ -1057,51 +1055,41 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
         if (string.IsNullOrWhiteSpace(targetSpn))
             throw new ArgumentException("Target SPN cannot be null or empty", nameof(targetSpn));
 
-        // Ensure all required privileges are enabled in the current process token.
-        // Being granted at OS level (secpol.msc) is not enough — they must be
-        // explicitly enabled via AdjustTokenPrivileges before use.
-        //
-        // Required privileges:
-        //   SeTcbPrivilege                — act as part of OS; allows S4U logon and token promotion
-        //   SeImpersonatePrivilege        — impersonate a client after authentication
-        //   SeAssignPrimaryTokenPrivilege — replace a process-level token (CreateProcessAsUser)
-        //   SeIncreaseQuotaPrivilege      — adjust memory quotas for a process (CreateProcessAsUser)
-        //   SeCreateTokenPrivilege        — create a primary token (DuplicateTokenEx promotion)
+        // Enable all privileges required by CreateProcessAsUser.
+        // SeTcbPrivilege + SeAssignPrimaryTokenPrivilege + SeIncreaseQuotaPrivilege
+        // allow CreateProcessAsUser to accept an Identification-level token directly —
+        // the OS performs the Primary token conversion internally.
+        // DuplicateTokenEx on an S4U Identification token always fails with 1346
+        // because the kernel blocks Impersonation→Primary promotion for S4U tokens
+        // regardless of what privileges are held.
         EnablePrivilege(NativeMethods.SE_TCB_NAME);
         EnablePrivilege("SeImpersonatePrivilege");
         EnablePrivilege("SeAssignPrimaryTokenPrivilege");
         EnablePrivilege("SeIncreaseQuotaPrivilege");
-        EnablePrivilege("SeCreateTokenPrivilege");
 
-        // DuplicateTokenEx: keep the same impersonation level (Identification=1).
-        // We cannot request a higher level than the source token — that always fails
-        // with 1346 regardless of privileges held.
-        // We only change the TOKEN_TYPE from Impersonation-token to Primary-token.
-        // CreateProcessAsUser (not CreateProcessWithTokenW) accepts a
-        // Primary/Identification token when the caller holds SeTcbPrivilege.
-        _logger.Information("[TokenManager] S4U2Proxy: calling DuplicateTokenEx (Identification→Primary)...");
+        _logger.Information("[TokenManager] ExecuteS4U2Proxy: privileges enabled, returning S4U token for CreateProcessAsUser");
+        LogTokenInfo("S4U2Proxy", userToken);
 
-        bool ok = NativeMethods.DuplicateTokenEx(
-            userToken,
-            NativeMethods.TOKEN_ALL_ACCESS,
-            IntPtr.Zero,
-            NativeMethods.SECURITY_IDENTIFICATION,  // same level as source — cannot promote
-            NativeMethods.TokenPrimary,              // only the type changes
-            out SafeAccessTokenHandle primaryToken);
+        // Return the S4U token as-is. CreateProcessAsUser in ProcessSpawner will use it.
+        // We duplicate the handle so the caller owns an independent reference.
+        bool ok = NativeMethods.DuplicateHandle(
+            NativeMethods.GetCurrentProcess(),
+            userToken.DangerousGetHandle(),
+            NativeMethods.GetCurrentProcess(),
+            out IntPtr dupPtr,
+            0,
+            false,
+            2); // DUPLICATE_SAME_ACCESS
 
-        if (!ok || primaryToken == null || primaryToken.IsInvalid)
+        if (!ok)
         {
             int err = Marshal.GetLastWin32Error();
-            _logger.Error("[TokenManager] DuplicateTokenEx failed: Win32 {Win32Error} (0x{Win32ErrorHex:X8})", err, err);
             throw new KerberosException(
-                $"DuplicateTokenEx failed. Win32 error: {err} (0x{err:X8}). " +
-                $"Verify SeTcbPrivilege, SeImpersonatePrivilege and SeAssignPrimaryTokenPrivilege are granted.",
+                $"DuplicateHandle failed: Win32 {err} (0x{err:X8})",
                 err, KerberosErrorType.S4U2ProxyFailed);
         }
 
-        _logger.Information("[TokenManager] ExecuteS4U2Proxy completed — Primary token ready");
-        LogTokenInfo("S4U2Proxy", primaryToken);
-        return primaryToken;
+        return new SafeAccessTokenHandle(dupPtr);
     }
 
     /// <summary>
