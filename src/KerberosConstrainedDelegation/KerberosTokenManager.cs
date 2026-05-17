@@ -1057,14 +1057,21 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
         if (string.IsNullOrWhiteSpace(targetSpn))
             throw new ArgumentException("Target SPN cannot be null or empty", nameof(targetSpn));
 
-        // Ensure all three privileges are enabled in the current process token.
-        // Being granted at OS level is not enough — they must be in the Enabled state.
-        // SeTcbPrivilege       — allows promoting Identification tokens via DuplicateTokenEx
-        // SeImpersonatePrivilege — required by CreateProcessWithTokenW
-        // SeAssignPrimaryTokenPrivilege — required by CreateProcessAsUser
+        // Ensure all required privileges are enabled in the current process token.
+        // Being granted at OS level (secpol.msc) is not enough — they must be
+        // explicitly enabled via AdjustTokenPrivileges before use.
+        //
+        // Required privileges:
+        //   SeTcbPrivilege                — act as part of OS; allows S4U logon and token promotion
+        //   SeImpersonatePrivilege        — impersonate a client after authentication
+        //   SeAssignPrimaryTokenPrivilege — replace a process-level token (CreateProcessAsUser)
+        //   SeIncreaseQuotaPrivilege      — adjust memory quotas for a process (CreateProcessAsUser)
+        //   SeCreateTokenPrivilege        — create a primary token (DuplicateTokenEx promotion)
         EnablePrivilege(NativeMethods.SE_TCB_NAME);
         EnablePrivilege("SeImpersonatePrivilege");
         EnablePrivilege("SeAssignPrimaryTokenPrivilege");
+        EnablePrivilege("SeIncreaseQuotaPrivilege");
+        EnablePrivilege("SeCreateTokenPrivilege");
 
         // DuplicateTokenEx: keep the same impersonation level (Identification=1).
         // We cannot request a higher level than the source token — that always fails
