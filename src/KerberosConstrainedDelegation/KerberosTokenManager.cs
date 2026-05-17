@@ -1053,37 +1053,46 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
         if (string.IsNullOrWhiteSpace(targetSpn))
             throw new ArgumentException("Target SPN cannot be null or empty", nameof(targetSpn));
 
-        // The S4U2Self token is Identification-level. We cannot elevate it.
-        // CreateProcessWithTokenW (unlike CreateProcessAsUser) accepts Identification-level
-        // tokens directly. The OS performs S4U2Proxy transparently when the spawned
-        // process first accesses targetSpn, using the service account's constrained
-        // delegation configuration in AD.
+        // S4U2Self returns an Identification-level token.
+        // CreateProcessWithTokenW requires at minimum Impersonation level — passing an
+        // Identification-level token causes ERROR_BAD_IMPERSONATION_LEVEL (1346).
         //
-        // We just duplicate the handle (same access, no level change) so the caller
-        // owns an independent reference that it can safely dispose.
-        _logger.Information("[TokenManager] S4U2Proxy: duplicating S4U2Self token handle for CreateProcessWithTokenW...");
+        // DuplicateTokenEx lets us promote the level while also converting the token
+        // type to Primary, which is what CreateProcessWithTokenW actually needs.
+        //
+        // TOKEN_ALL_ACCESS (0x000F01FF) gives the new token full rights so the spawned
+        // process can open its own token for identity queries.
+        //
+        // The service account must hold SeImpersonatePrivilege (granted by default to
+        // services) for this call to succeed. SeTcbPrivilege is NOT required here.
+        _logger.Information("[TokenManager] S4U2Proxy: promoting S4U2Self token to Primary/Impersonation via DuplicateTokenEx...");
 
-        bool ok = NativeMethods.DuplicateHandle(
-            NativeMethods.GetCurrentProcess(),
-            userToken.DangerousGetHandle(),
-            NativeMethods.GetCurrentProcess(),
-            out IntPtr dupPtr,
-            0,      // dwDesiredAccess = 0 with DUPLICATE_SAME_ACCESS copies the same rights
-            false,
-            2);     // DUPLICATE_SAME_ACCESS = 2
+        const int TOKEN_ALL_ACCESS       = 0x000F01FF;
+        const int SecurityImpersonation  = 2;   // SECURITY_IMPERSONATION_LEVEL
+        const int TokenPrimary           = 1;   // TOKEN_TYPE — required by CreateProcessWithTokenW
 
-        if (!ok)
+        bool ok = NativeMethods.DuplicateTokenEx(
+            userToken,
+            TOKEN_ALL_ACCESS,
+            IntPtr.Zero,            // default security attributes
+            SecurityImpersonation,  // promote from Identification → Impersonation
+            TokenPrimary,           // CreateProcessWithTokenW requires a Primary token
+            out SafeAccessTokenHandle primaryToken);
+
+        if (!ok || primaryToken == null || primaryToken.IsInvalid)
         {
             int err = Marshal.GetLastWin32Error();
+            _logger.Error("[TokenManager] DuplicateTokenEx failed: Win32 {Win32Error} (0x{Win32ErrorHex:X8}). " +
+                          "Ensure the service account has SeImpersonatePrivilege.", err, err);
             throw new KerberosException(
-                $"DuplicateHandle for S4U token failed: Win32 error {err}",
+                $"DuplicateTokenEx failed promoting S4U token to Primary level. Win32 error: {err} (0x{err:X8}). " +
+                $"Ensure the service account has SeImpersonatePrivilege.",
                 err, KerberosErrorType.S4U2ProxyFailed);
         }
 
-        _logger.Information("[TokenManager] ExecuteS4U2Proxy completed — token ready for CreateProcessWithTokenW");
-        var dupToken = new SafeAccessTokenHandle(dupPtr);
-        LogTokenInfo("S4U2Proxy", dupToken);
-        return dupToken;
+        _logger.Information("[TokenManager] ExecuteS4U2Proxy completed — Primary token ready for CreateProcessWithTokenW");
+        LogTokenInfo("S4U2Proxy", primaryToken);
+        return primaryToken;
     }
 
     /// <summary>
