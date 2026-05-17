@@ -1,6 +1,8 @@
 using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
+using Serilog;
+using ILogger = Serilog.ILogger;
 
 namespace KerberosConstrainedDelegation;
 
@@ -9,43 +11,54 @@ namespace KerberosConstrainedDelegation;
 /// </summary>
 public sealed class ProcessSpawner : IProcessSpawner
 {
+    private readonly ILogger _logger;
+
+    /// <summary>
+    /// Initializes a new instance of ProcessSpawner.
+    /// </summary>
+    /// <param name="logger">
+    /// Optional Serilog logger. Falls back to the global Log.Logger when null.
+    /// </param>
+    public ProcessSpawner(ILogger? logger = null)
+    {
+        _logger = (logger ?? Log.Logger).ForContext<ProcessSpawner>();
+    }
+
     /// <summary>
     /// Starts a process with the specified token and arguments
     /// </summary>
-    /// <param name="token">Security token to use for the process</param>
-    /// <param name="executablePath">Path to the executable</param>
-    /// <param name="arguments">Command-line arguments</param>
-    /// <param name="timeoutMs">Maximum time to wait for process completion (default: 30 seconds)</param>
-    /// <returns>Process execution result including exit code and output</returns>
-    /// <exception cref="ArgumentException">Thrown when token is invalid or executable path is invalid</exception>
-    /// <exception cref="FileNotFoundException">Thrown when executable file does not exist</exception>
-    /// <exception cref="KerberosException">Thrown when process spawning fails</exception>
     public ProcessExecutionResult SpawnProcessWithToken(
         SafeAccessTokenHandle token,
         string executablePath,
         string arguments,
         int timeoutMs = 30000)
     {
+        _logger.Information("[ProcessSpawner] SpawnProcessWithToken called");
+        _logger.Information("[ProcessSpawner]   Executable : {Executable}", executablePath);
+        _logger.Information("[ProcessSpawner]   Arguments  : {Arguments}", arguments);
+        _logger.Information("[ProcessSpawner]   TimeoutMs  : {TimeoutMs}", timeoutMs);
+        _logger.Information("[ProcessSpawner]   Token valid: {TokenValid}", token != null && !token.IsInvalid);
+
         // Step 1: Validate inputs
         if (token == null || token.IsInvalid)
-        {
             throw new ArgumentException("Invalid token handle", nameof(token));
-        }
 
         if (string.IsNullOrWhiteSpace(executablePath))
-        {
             throw new ArgumentException("Executable path cannot be null or empty", nameof(executablePath));
-        }
 
         if (timeoutMs <= 0)
-        {
             throw new ArgumentException("Timeout must be positive", nameof(timeoutMs));
-        }
 
         if (!File.Exists(executablePath))
         {
+            _logger.Error("[ProcessSpawner] Executable not found: {Executable}", executablePath);
             throw new FileNotFoundException($"Executable not found: {executablePath}", executablePath);
         }
+
+        _logger.Information("[ProcessSpawner] Exe exists on disk: true");
+
+        // Log token type/level before attempting spawn
+        LogTokenStats(token);
 
         var startTime = DateTime.UtcNow;
         SafeFileHandle? stdOutRead = null;
@@ -57,23 +70,25 @@ public sealed class ProcessSpawner : IProcessSpawner
 
         try
         {
-            // Step 2: Create pipes for standard output and error
+            // Step 2: Create pipes for stdout and stderr
+            _logger.Information("[ProcessSpawner] Creating stdout/stderr pipes...");
             CreatePipe(out stdOutRead, out stdOutWrite, true);
             CreatePipe(out stdErrRead, out stdErrWrite, true);
+            _logger.Information("[ProcessSpawner] Pipes created successfully");
 
-            // Step 3: Prepare process startup information.
-            // bInheritHandles=true on CreateProcessAsUser means the pipe write handles
-            // are inherited by the child — no need for any special flags beyond
-            // STARTF_USESTDHANDLES. CREATE_NO_WINDOW suppresses any console window.
+            // Step 3: Build STARTUPINFO
             var startupInfo = new NativeMethods.STARTUPINFO
             {
-                cb = Marshal.SizeOf<NativeMethods.STARTUPINFO>(),
-                dwFlags = NativeMethods.STARTF_USESTDHANDLES,
+                cb         = Marshal.SizeOf<NativeMethods.STARTUPINFO>(),
+                dwFlags    = NativeMethods.STARTF_USESTDHANDLES,
                 wShowWindow = 0,
-                hStdInput = IntPtr.Zero,
+                hStdInput  = IntPtr.Zero,
                 hStdOutput = stdOutWrite.DangerousGetHandle(),
-                hStdError = stdErrWrite.DangerousGetHandle()
+                hStdError  = stdErrWrite.DangerousGetHandle()
             };
+
+            _logger.Information("[ProcessSpawner] STARTUPINFO.cb      = {Cb}", startupInfo.cb);
+            _logger.Information("[ProcessSpawner] STARTUPINFO.dwFlags = 0x{Flags:X}", startupInfo.dwFlags);
 
             // Step 4: Build command line
             var commandLine = string.IsNullOrWhiteSpace(arguments)
@@ -82,18 +97,16 @@ public sealed class ProcessSpawner : IProcessSpawner
 
             string? workingDirectory = null;
 
-            Console.WriteLine($"[ProcessSpawner] Executable: {executablePath}");
-            Console.WriteLine($"[ProcessSpawner] CommandLine: {commandLine}");
-            Console.WriteLine($"[ProcessSpawner] Exe exists:  {File.Exists(executablePath)}");
+            _logger.Information("[ProcessSpawner] CommandLine      : {CommandLine}", commandLine);
+            _logger.Information("[ProcessSpawner] WorkingDirectory : {WorkingDir}", workingDirectory ?? "(inherited)");
+            _logger.Information("[ProcessSpawner] CreationFlags    : CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT");
 
-            // Step 5: Spawn the process under the delegated token.
-            // CreateProcessWithTokenW accepts Impersonation-type tokens (which is what
-            // LsaLogonUser S4U returns). CreateProcessAsUser requires a Primary token
-            // and fails with 1346 on S4U tokens.
-            // SeImpersonatePrivilege is required and is enabled in ExecuteS4U2Proxy.
+            // Step 5: Call CreateProcessWithTokenW
+            _logger.Information("[ProcessSpawner] Calling CreateProcessWithTokenW...");
+
             var success = NativeMethods.CreateProcessWithTokenW(
                 token,
-                0,          // dwLogonFlags
+                0,
                 null,
                 commandLine,
                 NativeMethods.CREATE_NO_WINDOW | NativeMethods.CREATE_UNICODE_ENVIRONMENT,
@@ -105,33 +118,43 @@ public sealed class ProcessSpawner : IProcessSpawner
             if (!success)
             {
                 var error = Marshal.GetLastWin32Error();
+                _logger.Error("[ProcessSpawner] CreateProcessWithTokenW FAILED");
+                _logger.Error("[ProcessSpawner]   Win32 error : {Error} (0x{ErrorHex:X8})", error, error);
+                _logger.Error("[ProcessSpawner]   Executable  : {Executable}", executablePath);
+                _logger.Error("[ProcessSpawner]   CommandLine : {CommandLine}", commandLine);
+                _logger.Error("[ProcessSpawner]   Token valid : {TokenValid}", !token.IsInvalid);
                 throw new KerberosException(
-                    $"CreateProcessWithTokenW failed. Win32 error: {error} (0x{error:X8}). " +
-                    $"Executable: {executablePath}",
+                    $"CreateProcessWithTokenW failed. Win32 error: {error} (0x{error:X8}). Executable: {executablePath}",
                     error,
                     KerberosErrorType.ProcessSpawnFailed);
             }
 
             processHandle = processInfo.hProcess;
-            threadHandle = processInfo.hThread;
+            threadHandle  = processInfo.hThread;
 
-            // Step 6: Close write ends of pipes (child process owns them)
-            stdOutWrite.Dispose();
-            stdOutWrite = null;
-            stdErrWrite.Dispose();
-            stdErrWrite = null;
+            _logger.Information("[ProcessSpawner] CreateProcessWithTokenW succeeded");
+            _logger.Information("[ProcessSpawner]   PID         : {Pid}", processInfo.dwProcessId);
+            _logger.Information("[ProcessSpawner]   TID         : {Tid}", processInfo.dwThreadId);
 
-            // Step 7: Wait for process completion with timeout
+            // Step 6: Close write ends of pipes — child owns them now
+            stdOutWrite.Dispose(); stdOutWrite = null;
+            stdErrWrite.Dispose(); stdErrWrite = null;
+            _logger.Information("[ProcessSpawner] Write pipe ends closed");
+
+            // Step 7: Wait for process completion
+            _logger.Information("[ProcessSpawner] Waiting for process (timeout {TimeoutMs} ms)...", timeoutMs);
             var waitResult = NativeMethods.WaitForSingleObject(processHandle, (uint)timeoutMs);
-            var timedOut = (waitResult == NativeMethods.WAIT_TIMEOUT);
+            var timedOut   = waitResult == NativeMethods.WAIT_TIMEOUT;
 
             if (timedOut)
             {
-                // Terminate process if it timed out
+                _logger.Warning("[ProcessSpawner] Process timed out — terminating");
                 NativeMethods.TerminateProcess(processHandle, 1);
-                
-                // Wait a bit for termination to complete
                 NativeMethods.WaitForSingleObject(processHandle, 1000);
+            }
+            else
+            {
+                _logger.Information("[ProcessSpawner] Process completed (WaitForSingleObject result: 0x{Result:X})", waitResult);
             }
 
             // Step 8: Get exit code
@@ -139,28 +162,35 @@ public sealed class ProcessSpawner : IProcessSpawner
             {
                 var error = Marshal.GetLastWin32Error();
                 throw new KerberosException(
-                    $"GetExitCodeProcess failed with error: 0x{error:X8}",
-                    error,
-                    KerberosErrorType.ProcessSpawnFailed);
+                    $"GetExitCodeProcess failed: 0x{error:X8}", error, KerberosErrorType.ProcessSpawnFailed);
             }
 
-            // Step 9: Read standard output and error asynchronously to prevent deadlocks
+            _logger.Information("[ProcessSpawner] Exit code: {ExitCode}", exitCode);
+
+            // Step 9: Read stdout/stderr
             var stdOut = ReadFromPipe(stdOutRead);
             var stdErr = ReadFromPipe(stdErrRead);
 
+            if (!string.IsNullOrWhiteSpace(stdOut))
+                _logger.Information("[ProcessSpawner] stdout:\n{StdOut}", stdOut.TrimEnd());
+            if (!string.IsNullOrWhiteSpace(stdErr))
+                _logger.Warning("[ProcessSpawner] stderr:\n{StdErr}", stdErr.TrimEnd());
+
             var executionTime = DateTime.UtcNow - startTime;
+            _logger.Information("[ProcessSpawner] Execution time: {ElapsedMs} ms", (int)executionTime.TotalMilliseconds);
 
             return new ProcessExecutionResult
             {
-                ExitCode = exitCode,
-                StandardOutput = stdOut,
-                StandardError = stdErr,
-                TimedOut = timedOut,
-                ExecutionTime = executionTime
+                ExitCode        = exitCode,
+                StandardOutput  = stdOut,
+                StandardError   = stdErr,
+                TimedOut        = timedOut,
+                ExecutionTime   = executionTime
             };
         }
         catch (Exception ex) when (ex is not KerberosException)
         {
+            _logger.Error(ex, "[ProcessSpawner] Unexpected exception: {ErrorMessage}", ex.Message);
             throw new KerberosException(
                 $"Process spawning failed: {ex.Message}",
                 Marshal.GetLastWin32Error(),
@@ -169,67 +199,86 @@ public sealed class ProcessSpawner : IProcessSpawner
         }
         finally
         {
-            // Step 10: Close all handles properly
             stdOutRead?.Dispose();
             stdOutWrite?.Dispose();
             stdErrRead?.Dispose();
             stdErrWrite?.Dispose();
 
-            if (processHandle != IntPtr.Zero)
-            {
-                NativeMethods.CloseHandle(processHandle);
-            }
-
-            if (threadHandle != IntPtr.Zero)
-            {
-                NativeMethods.CloseHandle(threadHandle);
-            }
+            if (processHandle != IntPtr.Zero) NativeMethods.CloseHandle(processHandle);
+            if (threadHandle  != IntPtr.Zero) NativeMethods.CloseHandle(threadHandle);
         }
     }
 
     /// <summary>
-    /// Creates a pipe for inter-process communication
+    /// Logs TOKEN_STATISTICS for the token being passed to CreateProcessWithTokenW.
+    /// Uses only GetTokenInformation — avoids WindowsIdentity which throws on S4U tokens.
     /// </summary>
-    /// <param name="readHandle">Output parameter for the read end of the pipe</param>
-    /// <param name="writeHandle">Output parameter for the write end of the pipe</param>
-    /// <param name="inheritHandle">Whether the handles should be inheritable by child processes</param>
-    /// <exception cref="KerberosException">Thrown when pipe creation fails</exception>
+    private void LogTokenStats(SafeAccessTokenHandle token)
+    {
+        try
+        {
+            NativeMethods.GetTokenInformation(token, NativeMethods.TokenStatistics,
+                IntPtr.Zero, 0, out int needed);
+            var buf = Marshal.AllocHGlobal(needed);
+            try
+            {
+                if (!NativeMethods.GetTokenInformation(token, NativeMethods.TokenStatistics,
+                        buf, needed, out _))
+                {
+                    _logger.Warning("[ProcessSpawner] GetTokenInformation(TokenStatistics) failed: Win32 {Err}",
+                        Marshal.GetLastWin32Error());
+                    return;
+                }
+
+                var stats = Marshal.PtrToStructure<NativeMethods.TOKEN_STATISTICS>(buf);
+                string tokenType = stats.TokenType switch
+                {
+                    1 => "Primary",
+                    2 => "Impersonation",
+                    _ => $"Unknown({stats.TokenType})"
+                };
+                string impLevel = stats.ImpersonationLevel switch
+                {
+                    0 => "Anonymous",
+                    1 => "Identification",
+                    2 => "Impersonation",
+                    3 => "Delegation",
+                    _ => $"Unknown({stats.ImpersonationLevel})"
+                };
+
+                _logger.Information("[ProcessSpawner] Token stats: Type={TokenType} Level={ImpLevel} LogonId={LogonHigh:X8}:{LogonLow:X8}",
+                    tokenType, impLevel,
+                    stats.AuthenticationId.HighPart, stats.AuthenticationId.LowPart);
+            }
+            finally { Marshal.FreeHGlobal(buf); }
+        }
+        catch (Exception ex)
+        {
+            _logger.Warning("[ProcessSpawner] LogTokenStats failed: {ErrorMessage}", ex.Message);
+        }
+    }
+
     private void CreatePipe(out SafeFileHandle readHandle, out SafeFileHandle writeHandle, bool inheritHandle)
     {
-        var securityAttributes = new NativeMethods.SECURITY_ATTRIBUTES
+        var sa = new NativeMethods.SECURITY_ATTRIBUTES
         {
-            nLength = Marshal.SizeOf<NativeMethods.SECURITY_ATTRIBUTES>(),
+            nLength              = Marshal.SizeOf<NativeMethods.SECURITY_ATTRIBUTES>(),
             lpSecurityDescriptor = IntPtr.Zero,
-            bInheritHandle = inheritHandle
+            bInheritHandle       = inheritHandle
         };
 
-        var success = NativeMethods.CreatePipe(
-            out readHandle,
-            out writeHandle,
-            ref securityAttributes,
-            0); // Use default buffer size
-
-        if (!success)
+        if (!NativeMethods.CreatePipe(out readHandle, out writeHandle, ref sa, 0))
         {
             var error = Marshal.GetLastWin32Error();
+            _logger.Error("[ProcessSpawner] CreatePipe failed: Win32 {Error} (0x{ErrorHex:X8})", error, error);
             throw new KerberosException(
-                $"CreatePipe failed with error: 0x{error:X8}",
-                error,
-                KerberosErrorType.ProcessSpawnFailed);
+                $"CreatePipe failed: 0x{error:X8}", error, KerberosErrorType.ProcessSpawnFailed);
         }
     }
 
-    /// <summary>
-    /// Reads all available data from a pipe asynchronously to prevent deadlocks
-    /// </summary>
-    /// <param name="pipeHandle">Handle to the read end of the pipe</param>
-    /// <returns>String containing all data read from the pipe</returns>
     private string ReadFromPipe(SafeFileHandle pipeHandle)
     {
-        if (pipeHandle == null || pipeHandle.IsInvalid)
-        {
-            return string.Empty;
-        }
+        if (pipeHandle == null || pipeHandle.IsInvalid) return string.Empty;
 
         var output = new StringBuilder();
         var buffer = new byte[4096];
@@ -238,49 +287,20 @@ public sealed class ProcessSpawner : IProcessSpawner
         {
             while (true)
             {
-                // Check if there's data available in the pipe
-                if (!NativeMethods.PeekNamedPipe(
-                    pipeHandle,
-                    IntPtr.Zero,
-                    0,
-                    IntPtr.Zero,
-                    out uint bytesAvailable,
-                    IntPtr.Zero))
-                {
-                    // Pipe is closed or error occurred
+                if (!NativeMethods.PeekNamedPipe(pipeHandle, IntPtr.Zero, 0,
+                        IntPtr.Zero, out uint bytesAvailable, IntPtr.Zero))
                     break;
-                }
 
-                if (bytesAvailable == 0)
-                {
-                    // No more data available
+                if (bytesAvailable == 0) break;
+
+                if (!NativeMethods.ReadFile(pipeHandle, buffer, (uint)buffer.Length,
+                        out uint bytesRead, IntPtr.Zero) || bytesRead == 0)
                     break;
-                }
 
-                // Read available data
-                var success = NativeMethods.ReadFile(
-                    pipeHandle,
-                    buffer,
-                    (uint)buffer.Length,
-                    out uint bytesRead,
-                    IntPtr.Zero);
-
-                if (!success || bytesRead == 0)
-                {
-                    // End of file or error
-                    break;
-                }
-
-                // Convert bytes to string and append
-                var text = Encoding.UTF8.GetString(buffer, 0, (int)bytesRead);
-                output.Append(text);
+                output.Append(Encoding.UTF8.GetString(buffer, 0, (int)bytesRead));
             }
         }
-        catch (Exception)
-        {
-            // If reading fails, return what we have so far
-            // Don't throw exception as this is a best-effort operation
-        }
+        catch { /* best-effort */ }
 
         return output.ToString();
     }
