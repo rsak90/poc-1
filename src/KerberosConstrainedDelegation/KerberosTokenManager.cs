@@ -1041,12 +1041,13 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
     }
 
     /// <summary>
-    /// Executes S4U2Proxy (Service for User to Proxy) to obtain a service ticket for the target service using delegated credentials
+    /// Executes S4U2Proxy: converts the Identification-level S4U token into a
+    /// Primary token that CreateProcessAsUser can accept.
+    ///
+    /// With SeTcbPrivilege held and enabled, DuplicateTokenEx can promote an
+    /// Identification token directly to Primary/Impersonation. The privilege must
+    /// be explicitly enabled in the process token — being granted is not enough.
     /// </summary>
-    /// <param name="userToken">User token obtained from S4U2Self (Identification-level)</param>
-    /// <param name="targetSpn">Target Service Principal Name for delegation</param>
-    /// <returns>Primary SafeAccessTokenHandle suitable for CreateProcessWithTokenW</returns>
-    /// <exception cref="KerberosException">Thrown when S4U2Proxy fails</exception>
     private SafeAccessTokenHandle ExecuteS4U2Proxy(SafeAccessTokenHandle userToken, string targetSpn)
     {
         _logger.Information("[TokenManager] ExecuteS4U2Proxy called for target SPN: {TargetSpn}", targetSpn);
@@ -1056,104 +1057,82 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
         if (string.IsNullOrWhiteSpace(targetSpn))
             throw new ArgumentException("Target SPN cannot be null or empty", nameof(targetSpn));
 
-        // LsaLogonUser with KERB_S4U_LOGON always returns an Identification-level token
-        // regardless of logon type — this is a Windows security constraint, not a bug.
-        // Identification tokens cannot be used with CreateProcessWithTokenW (error 1346).
-        //
-        // The correct pattern to get a usable Primary token from an Identification token:
-        //
-        //   1. ImpersonateLoggedOnUser  — sets the S4U identity on the current thread.
-        //                                 This works even with Identification-level tokens
-        //                                 when the caller holds SeTcbPrivilege.
-        //   2. OpenThreadToken          — retrieves the thread's impersonation token,
-        //                                 which is Impersonation-level (not Identification).
-        //   3. DuplicateTokenEx         — converts the Impersonation token to a Primary
-        //                                 token, which CreateProcessWithTokenW requires.
-        //   4. RevertToSelf             — removes the impersonation from the thread.
-        //
-        // No logoff/login or AD changes are needed. SeTcbPrivilege (already granted) is
-        // sufficient for step 1.
+        // Ensure all three privileges are enabled in the current process token.
+        // Being granted at OS level is not enough — they must be in the Enabled state.
+        // SeTcbPrivilege       — allows promoting Identification tokens via DuplicateTokenEx
+        // SeImpersonatePrivilege — required by CreateProcessWithTokenW
+        // SeAssignPrimaryTokenPrivilege — required by CreateProcessAsUser
+        EnablePrivilege(NativeMethods.SE_TCB_NAME);
+        EnablePrivilege("SeImpersonatePrivilege");
+        EnablePrivilege("SeAssignPrimaryTokenPrivilege");
 
-        const uint TOKEN_ALL_ACCESS     = 0x000F01FF;
-        const int  SecurityImpersonation = 2;
-        const int  TokenPrimary          = 1;
+        // DuplicateTokenEx with SeTcbPrivilege enabled can promote an Identification
+        // token to Impersonation level and change its type to Primary in one call.
+        _logger.Information("[TokenManager] S4U2Proxy: calling DuplicateTokenEx to produce Primary token...");
 
-        SafeAccessTokenHandle? threadToken  = null;
-        SafeAccessTokenHandle? primaryToken = null;
-        bool impersonating = false;
+        bool ok = NativeMethods.DuplicateTokenEx(
+            userToken,
+            NativeMethods.TOKEN_ALL_ACCESS,
+            IntPtr.Zero,
+            NativeMethods.SECURITY_IMPERSONATION,   // promote Identification → Impersonation
+            NativeMethods.TokenPrimary,              // CreateProcessAsUser requires Primary
+            out SafeAccessTokenHandle primaryToken);
 
-        try
+        if (!ok || primaryToken == null || primaryToken.IsInvalid)
         {
-            // Step 1: Impersonate the S4U user on the current thread
-            _logger.Information("[TokenManager] S4U2Proxy: calling ImpersonateLoggedOnUser...");
-            if (!NativeMethods.ImpersonateLoggedOnUser(userToken))
-            {
-                int err = Marshal.GetLastWin32Error();
-                _logger.Error("[TokenManager] ImpersonateLoggedOnUser failed: Win32 {Win32Error} (0x{Win32ErrorHex:X8})", err, err);
-                throw new KerberosException(
-                    $"ImpersonateLoggedOnUser failed. Win32 error: {err} (0x{err:X8}). " +
-                    $"Ensure the service account has SeTcbPrivilege.",
-                    err, KerberosErrorType.S4U2ProxyFailed);
-            }
-            impersonating = true;
-            _logger.Information("[TokenManager] S4U2Proxy: impersonation active on current thread");
-
-            // Step 2: Open the thread's impersonation token (Impersonation-level).
-            // OpenAsSelf=true is critical here — it opens the thread token using the
-            // process's primary token security context, not the impersonated identity.
-            // With OpenAsSelf=false and an Identification-level impersonation token,
-            // OpenThreadToken fails with 1346 because Identification doesn't allow
-            // the impersonated identity to open its own thread token.
-            if (!NativeMethods.OpenThreadToken(
-                    NativeMethods.GetCurrentThread(),
-                    TOKEN_ALL_ACCESS,
-                    true,               // OpenAsSelf=true — use process context, not impersonated
-                    out threadToken)
-                || threadToken == null || threadToken.IsInvalid)
-            {
-                int err = Marshal.GetLastWin32Error();
-                _logger.Error("[TokenManager] OpenThreadToken failed: Win32 {Win32Error} (0x{Win32ErrorHex:X8})", err, err);
-                throw new KerberosException(
-                    $"OpenThreadToken failed. Win32 error: {err} (0x{err:X8}).",
-                    err, KerberosErrorType.S4U2ProxyFailed);
-            }
-            _logger.Information("[TokenManager] S4U2Proxy: thread impersonation token obtained");
-
-            // Step 3: Duplicate to a Primary token for CreateProcessWithTokenW
-            if (!NativeMethods.DuplicateTokenEx(
-                    threadToken,
-                    (int)TOKEN_ALL_ACCESS,
-                    IntPtr.Zero,
-                    SecurityImpersonation,
-                    TokenPrimary,
-                    out primaryToken)
-                || primaryToken == null || primaryToken.IsInvalid)
-            {
-                int err = Marshal.GetLastWin32Error();
-                _logger.Error("[TokenManager] DuplicateTokenEx failed: Win32 {Win32Error} (0x{Win32ErrorHex:X8})", err, err);
-                throw new KerberosException(
-                    $"DuplicateTokenEx failed. Win32 error: {err} (0x{err:X8}).",
-                    err, KerberosErrorType.S4U2ProxyFailed);
-            }
-
-            _logger.Information("[TokenManager] ExecuteS4U2Proxy completed — Primary token ready for CreateProcessWithTokenW");
-            LogTokenInfo("S4U2Proxy", primaryToken);
-            return primaryToken;
+            int err = Marshal.GetLastWin32Error();
+            _logger.Error("[TokenManager] DuplicateTokenEx failed: Win32 {Win32Error} (0x{Win32ErrorHex:X8})", err, err);
+            throw new KerberosException(
+                $"DuplicateTokenEx failed. Win32 error: {err} (0x{err:X8}). " +
+                $"Verify SeTcbPrivilege, SeImpersonatePrivilege and SeAssignPrimaryTokenPrivilege are granted.",
+                err, KerberosErrorType.S4U2ProxyFailed);
         }
-        catch
+
+        _logger.Information("[TokenManager] ExecuteS4U2Proxy completed — Primary token ready");
+        LogTokenInfo("S4U2Proxy", primaryToken);
+        return primaryToken;
+    }
+
+    /// <summary>
+    /// Enables a named privilege in the current process token.
+    /// Logs a warning if the privilege is not held — does not throw.
+    /// </summary>
+    private void EnablePrivilege(string privilegeName)
+    {
+        if (!NativeMethods.OpenProcessToken(
+                NativeMethods.GetCurrentProcess(),
+                0x0020 | 0x0008, // TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY
+                out SafeAccessTokenHandle procToken))
         {
-            primaryToken?.Dispose();
-            throw;
+            _logger.Warning("[TokenManager] EnablePrivilege({Priv}): OpenProcessToken failed: {Err}",
+                privilegeName, Marshal.GetLastWin32Error());
+            return;
         }
-        finally
+
+        using (procToken)
         {
-            // Step 4: Always revert impersonation before leaving, even on failure
-            if (impersonating)
+            if (!NativeMethods.LookupPrivilegeValue(null, privilegeName, out NativeMethods.LUID luid))
             {
-                NativeMethods.RevertToSelf();
-                _logger.Information("[TokenManager] S4U2Proxy: thread impersonation reverted");
+                _logger.Warning("[TokenManager] EnablePrivilege({Priv}): LookupPrivilegeValue failed: {Err}",
+                    privilegeName, Marshal.GetLastWin32Error());
+                return;
             }
-            threadToken?.Dispose();
+
+            var tp = new NativeMethods.TOKEN_PRIVILEGES
+            {
+                PrivilegeCount = 1,
+                Privileges = new NativeMethods.LUID_AND_ATTRIBUTES[1]
+            };
+            tp.Privileges[0].Luid = luid;
+            tp.Privileges[0].Attributes = NativeMethods.SE_PRIVILEGE_ENABLED;
+
+            NativeMethods.AdjustTokenPrivileges(procToken, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+
+            int lastErr = Marshal.GetLastWin32Error();
+            if (lastErr == 1300) // ERROR_NOT_ALL_ASSIGNED
+                _logger.Warning("[TokenManager] EnablePrivilege({Priv}): privilege not held by this account", privilegeName);
+            else
+                _logger.Information("[TokenManager] EnablePrivilege({Priv}): enabled successfully", privilegeName);
         }
     }
 
