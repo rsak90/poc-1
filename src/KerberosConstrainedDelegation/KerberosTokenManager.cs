@@ -212,151 +212,51 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
     }
 
     /// <summary>
-    /// Dumps a comprehensive diagnostic snapshot of a token to the console and log file.
-    /// Call this at every stage of the delegation pipeline to make token
-    /// identity and type issues immediately visible in logs.
+    /// Logs key token identity fields (type, impersonation level, auth package) using
+    /// only GetTokenInformation — avoids constructing WindowsIdentity which can throw
+    /// on S4U Identification-level tokens in some contexts.
     /// </summary>
-    /// <param name="label">Short label shown in the log prefix, e.g. "ServiceToken", "S4U2Self", "S4U2Proxy"</param>
-    /// <param name="token">Token to inspect</param>
-    /// <param name="logger">Logger to write to. Falls back to the global Log.Logger when null.</param>
-    public static void LogTokenDiagnostics(string label, SafeAccessTokenHandle token, ILogger? logger = null)
+    private void LogTokenInfo(string label, SafeAccessTokenHandle token)
     {
-        var log = (logger ?? Log.Logger).ForContext("TokenDiagLabel", label);
-
         if (token == null || token.IsInvalid)
         {
-            log.Warning("[TokenDiag][{Label}] Token is NULL or INVALID — cannot inspect", label);
+            _logger.Warning("[TokenManager] [{Label}] token is NULL or INVALID", label);
             return;
         }
 
-        log.Debug("[TokenDiag][{Label}] ── Token Diagnostics ──────────────────────────────", label);
-
-        // ── WindowsIdentity fields ──────────────────────────────────────────────
-        try
-        {
-            using var identity = new WindowsIdentity(token.DangerousGetHandle());
-
-            log.Debug("[TokenDiag][{Label}]   Identity.Name          : {IdentityName}",          label, identity.Name);
-            log.Debug("[TokenDiag][{Label}]   AuthenticationType     : {AuthType}",               label, identity.AuthenticationType ?? "(null)");
-            log.Debug("[TokenDiag][{Label}]   IsAuthenticated        : {IsAuthenticated}",        label, identity.IsAuthenticated);
-            log.Debug("[TokenDiag][{Label}]   IsSystem               : {IsSystem}",               label, identity.IsSystem);
-            log.Debug("[TokenDiag][{Label}]   IsGuest                : {IsGuest}",                label, identity.IsGuest);
-            log.Debug("[TokenDiag][{Label}]   IsAnonymous            : {IsAnonymous}",            label, identity.IsAnonymous);
-            log.Debug("[TokenDiag][{Label}]   ImpersonationLevel     : {ImpersonationLevel}",     label, identity.ImpersonationLevel);
-            log.Debug("[TokenDiag][{Label}]   TokenType              : {TokenType}",              label,
-                identity.ImpersonationLevel == TokenImpersonationLevel.None ? "Primary" : "Impersonation");
-
-            // User SID
-            log.Debug("[TokenDiag][{Label}]   User SID               : {UserSid}", label, identity.User?.Value ?? "(null)");
-
-            // Groups (first 10 to keep logs manageable)
-            var groups = identity.Groups;
-            if (groups != null)
-            {
-                int shown = 0;
-                foreach (var g in groups)
-                {
-                    if (shown >= 10)
-                    {
-                        log.Debug("[TokenDiag][{Label}]   Groups                 : ... (truncated, {Total} total)", label, groups.Count);
-                        break;
-                    }
-                    try
-                    {
-                        log.Debug("[TokenDiag][{Label}]   Group[{Index,2}]              : {GroupName} ({GroupSid})",
-                            label, shown, g.Translate(typeof(NTAccount)).Value, g.Value);
-                    }
-                    catch
-                    {
-                        log.Debug("[TokenDiag][{Label}]   Group[{Index,2}]              : {GroupSid} (name lookup failed)",
-                            label, shown, g.Value);
-                    }
-                    shown++;
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            log.Warning(ex, "[TokenDiag][{Label}]   WindowsIdentity ERROR  : {ErrorType}: {ErrorMessage}",
-                label, ex.GetType().Name, ex.Message);
-        }
-
-        // ── TOKEN_STATISTICS via GetTokenInformation ────────────────────────────
         try
         {
             NativeMethods.GetTokenInformation(token, NativeMethods.TokenStatistics, IntPtr.Zero, 0, out int needed);
             var buf = Marshal.AllocHGlobal(needed);
             try
             {
-                if (NativeMethods.GetTokenInformation(token, NativeMethods.TokenStatistics, buf, needed, out _))
+                if (!NativeMethods.GetTokenInformation(token, NativeMethods.TokenStatistics, buf, needed, out _))
                 {
-                    var stats = Marshal.PtrToStructure<NativeMethods.TOKEN_STATISTICS>(buf);
-                    string impLevel = stats.ImpersonationLevel switch
-                    {
-                        0 => "Anonymous",
-                        1 => "Identification",
-                        2 => "Impersonation",
-                        3 => "Delegation",
-                        _ => $"Unknown({stats.ImpersonationLevel})"
-                    };
-                    string tokenType = stats.TokenType switch
-                    {
-                        1 => "Primary",
-                        2 => "Impersonation",
-                        _ => $"Unknown({stats.TokenType})"
-                    };
-
-                    // ExpirationTime is a LARGE_INTEGER (100ns ticks since 1601-01-01).
-                    // S4U tokens often carry 0 or a sentinel that is outside the valid
-                    // Win32 FILETIME range, causing DateTime.FromFileTime to throw.
-                    // Guard with a range check and fall back to the raw hex value.
-                    string expirationStr;
-                    try
-                    {
-                        expirationStr = stats.ExpirationTime > 0 && stats.ExpirationTime < 2_650_467_743_999_999_999L
-                            ? DateTime.FromFileTime(stats.ExpirationTime).ToString("u")
-                            : $"(raw: 0x{stats.ExpirationTime:X16})";
-                    }
-                    catch
-                    {
-                        expirationStr = $"(raw: 0x{stats.ExpirationTime:X16})";
-                    }
-
-                    log.Debug("[TokenDiag][{Label}]   TOKEN_STATISTICS.Type  : {TokenType} ({TokenTypeId})",      label, tokenType, stats.TokenType);
-                    log.Debug("[TokenDiag][{Label}]   TOKEN_STATISTICS.Level : {ImpLevel} ({ImpLevelId})",        label, impLevel, stats.ImpersonationLevel);
-                    log.Debug("[TokenDiag][{Label}]   LogonId                : {LogonIdHigh:X8}:{LogonIdLow:X8}", label, stats.AuthenticationId.HighPart, stats.AuthenticationId.LowPart);
-                    log.Debug("[TokenDiag][{Label}]   ModifiedId             : {ModIdHigh:X8}:{ModIdLow:X8}",     label, stats.ModifiedId.HighPart, stats.ModifiedId.LowPart);
-                    log.Debug("[TokenDiag][{Label}]   ExpirationTime         : {ExpirationTime}",                 label, expirationStr);
-                }
-                else
-                {
-                    log.Warning("[TokenDiag][{Label}]   TOKEN_STATISTICS       : GetTokenInformation failed (Win32 {Win32Error})",
+                    _logger.Warning("[TokenManager] [{Label}] GetTokenInformation(TokenStatistics) failed: Win32 {Win32Error}",
                         label, Marshal.GetLastWin32Error());
+                    return;
                 }
+
+                var stats = Marshal.PtrToStructure<NativeMethods.TOKEN_STATISTICS>(buf);
+
+                string tokenType = stats.TokenType switch { 1 => "Primary", 2 => "Impersonation", _ => $"Unknown({stats.TokenType})" };
+                string impLevel  = stats.ImpersonationLevel switch
+                {
+                    0 => "Anonymous", 1 => "Identification", 2 => "Impersonation", 3 => "Delegation",
+                    _ => $"Unknown({stats.ImpersonationLevel})"
+                };
+
+                _logger.Information(
+                    "[TokenManager] [{Label}] TokenType={TokenType} ImpersonationLevel={ImpLevel} LogonId={LogonHigh:X8}:{LogonLow:X8}",
+                    label, tokenType, impLevel,
+                    stats.AuthenticationId.HighPart, stats.AuthenticationId.LowPart);
             }
             finally { Marshal.FreeHGlobal(buf); }
         }
         catch (Exception ex)
         {
-            log.Warning(ex, "[TokenDiag][{Label}]   TOKEN_STATISTICS ERROR : {ErrorType}: {ErrorMessage}",
-                label, ex.GetType().Name, ex.Message);
+            _logger.Warning("[TokenManager] [{Label}] LogTokenInfo failed: {ErrorMessage}", label, ex.Message);
         }
-
-        // ── TOKEN_ELEVATION ─────────────────────────────────────────────────────
-        try
-        {
-            NativeMethods.GetTokenInformation(token, NativeMethods.TokenElevation, IntPtr.Zero, 0, out int needed);
-            var buf = Marshal.AllocHGlobal(needed);
-            try
-            {
-                if (NativeMethods.GetTokenInformation(token, NativeMethods.TokenElevation, buf, needed, out _))
-                    log.Debug("[TokenDiag][{Label}]   IsElevated             : {IsElevated}", label, Marshal.ReadInt32(buf) != 0);
-            }
-            finally { Marshal.FreeHGlobal(buf); }
-        }
-        catch { /* non-critical */ }
-
-        log.Debug("[TokenDiag][{Label}] ───────────────────────────────────────────────────", label);
     }
 
     /// <summary>
@@ -383,9 +283,28 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
 
         try
         {
-            // Dump full token diagnostics first so every field is visible in logs
-            // regardless of whether validation passes or fails.
-            LogTokenDiagnostics($"ValidateToken({expectedUsername})", token, log);
+            // Log token type/level before any checks so it's visible even on failure
+            if (token != null && !token.IsInvalid)
+            {
+                try
+                {
+                    NativeMethods.GetTokenInformation(token, NativeMethods.TokenStatistics, IntPtr.Zero, 0, out int needed);
+                    var buf = Marshal.AllocHGlobal(needed);
+                    try
+                    {
+                        if (NativeMethods.GetTokenInformation(token, NativeMethods.TokenStatistics, buf, needed, out _))
+                        {
+                            var stats = Marshal.PtrToStructure<NativeMethods.TOKEN_STATISTICS>(buf);
+                            string tt = stats.TokenType switch { 1 => "Primary", 2 => "Impersonation", _ => $"Unknown({stats.TokenType})" };
+                            string il = stats.ImpersonationLevel switch { 0 => "Anonymous", 1 => "Identification", 2 => "Impersonation", 3 => "Delegation", _ => $"Unknown({stats.ImpersonationLevel})" };
+                            log.Information("[TokenManager] ValidateToken: TokenType={TokenType} ImpersonationLevel={ImpLevel} LogonId={LogonHigh:X8}:{LogonLow:X8}",
+                                tt, il, stats.AuthenticationId.HighPart, stats.AuthenticationId.LowPart);
+                        }
+                    }
+                    finally { Marshal.FreeHGlobal(buf); }
+                }
+                catch { /* non-critical */ }
+            }
 
             // Get the token account name (without domain) for comparison.
             // We compare only the account/username portion because the domain
@@ -868,7 +787,7 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
             }
 
             _logger.Information("[TokenManager] Service account authenticated successfully");
-            LogTokenDiagnostics("ServiceToken", token, _logger);
+            LogTokenInfo("ServiceToken", token);
             return token;
         }
         catch (KerberosException)
@@ -1092,7 +1011,7 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
                 }
 
                 _logger.Information("[TokenManager] Token is forwardable - ExecuteS4U2Self completed successfully");
-                LogTokenDiagnostics("S4U2Self", token, _logger);
+                LogTokenInfo("S4U2Self", token);
                 return token;
             }
             finally
@@ -1163,7 +1082,7 @@ public sealed class KerberosTokenManager : IKerberosTokenManager
 
         _logger.Information("[TokenManager] ExecuteS4U2Proxy completed — token ready for CreateProcessWithTokenW");
         var dupToken = new SafeAccessTokenHandle(dupPtr);
-        LogTokenDiagnostics("S4U2Proxy", dupToken, _logger);
+        LogTokenInfo("S4U2Proxy", dupToken);
         return dupToken;
     }
 

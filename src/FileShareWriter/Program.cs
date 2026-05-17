@@ -77,41 +77,46 @@ public class Program
                 return EXIT_IDENTITY_ERROR;
             }
 
-            // Validate UNC path format (must start with \\)
-            if (!uncPath.StartsWith(@"\\"))
-            {
-                Console.Error.WriteLine($"Error: Invalid UNC path format: {uncPath}");
-                Console.Error.WriteLine();
-                Console.Error.WriteLine("Troubleshooting:");
-                Console.Error.WriteLine("  - UNC paths must start with \\\\ (e.g., \\\\server\\share\\file.txt)");
-                Console.Error.WriteLine("  - Ensure the path is not a local path (e.g., C:\\...)");
-                Console.Error.WriteLine("  - Use double backslashes in the path");
-                return EXIT_INVALID_UNC_PATH;
-            }
+            // Accept both local paths and UNC paths.
+            // A local path write confirms the spawned process token is valid.
+            // A UNC path write confirms the full Kerberos delegation chain works.
+            bool isUncPath = uncPath.StartsWith(@"\\");
 
-            // Check that target directory exists
-            string? directory = Path.GetDirectoryName(uncPath);
-            if (string.IsNullOrEmpty(directory))
+            // For UNC paths, verify the target directory is reachable
+            if (isUncPath)
             {
-                Console.Error.WriteLine($"Error: Could not determine directory from path: {uncPath}");
-                Console.Error.WriteLine();
-                Console.Error.WriteLine("Troubleshooting:");
-                Console.Error.WriteLine("  - Ensure the UNC path includes a filename (e.g., \\\\server\\share\\file.txt)");
-                Console.Error.WriteLine("  - Check the path format is correct");
-                return EXIT_INVALID_UNC_PATH;
-            }
+                string? directory = Path.GetDirectoryName(uncPath);
+                if (string.IsNullOrEmpty(directory))
+                {
+                    Console.Error.WriteLine($"Error: Could not determine directory from UNC path: {uncPath}");
+                    return EXIT_INVALID_UNC_PATH;
+                }
 
-            if (!Directory.Exists(directory))
+                if (!Directory.Exists(directory))
+                {
+                    Console.Error.WriteLine($"Error: Target directory does not exist or is not reachable: {directory}");
+                    Console.Error.WriteLine();
+                    Console.Error.WriteLine("Troubleshooting:");
+                    Console.Error.WriteLine("  - Verify the server name is correct and reachable");
+                    Console.Error.WriteLine("  - Verify the share name exists on the server");
+                    Console.Error.WriteLine("  - Check network connectivity to the file share");
+                    Console.Error.WriteLine("  - Ensure Kerberos delegation is working correctly");
+                    return EXIT_DIRECTORY_NOT_FOUND;
+                }
+            }
+            else
             {
-                Console.Error.WriteLine($"Error: Target directory does not exist: {directory}");
-                Console.Error.WriteLine();
-                Console.Error.WriteLine("Troubleshooting:");
-                Console.Error.WriteLine("  - Verify the server name is correct and reachable");
-                Console.Error.WriteLine("  - Verify the share name exists on the server");
-                Console.Error.WriteLine("  - Check network connectivity to the file share");
-                Console.Error.WriteLine("  - Ensure the share is accessible from this machine");
-                Console.Error.WriteLine("  - Verify DNS resolution for the server name");
-                return EXIT_DIRECTORY_NOT_FOUND;
+                // Local path — ensure the directory exists, create it if needed
+                string? directory = Path.GetDirectoryName(uncPath);
+                if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
+                {
+                    try { Directory.CreateDirectory(directory); }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"Error: Could not create local directory '{directory}': {ex.Message}");
+                        return EXIT_IO_ERROR;
+                    }
+                }
             }
 
             // Write content to file at UNC path, including timestamp and user identity

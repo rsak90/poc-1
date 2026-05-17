@@ -114,59 +114,80 @@ public class Program
             Log.Information("Initializing Process Spawner...");
             var processSpawner = new ProcessSpawner();
 
-            // Step 8: Build command-line arguments for FileShareWriter
-            var arguments = $"\"{fileSharePath}\" \"Test content from delegated process - {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC\"";
+            // ── Stage 1: Local write test ─────────────────────────────────────────
+            // Write to a local folder first. If this fails the token itself is broken
+            // (spawn failed, wrong identity, no local write access). If it succeeds we
+            // know the delegation chain and process spawning work — the network share is
+            // the only remaining variable.
+            var localTestPath = configuration["LocalTest:Path"]
+                ?? Path.Combine(Path.GetTempPath(), "delegation-test", "test.txt");
 
-            // Step 9: Spawn FileShareWriter process with delegated token
-            Log.Information("Spawning process: {Executable}", executablePath);
-            Log.Information("Arguments: {Arguments}", arguments);
-            Log.Information("");
+            Log.Information("─────────────────────────────────────────────────────");
+            Log.Information("Stage 1: Local write test");
+            Log.Information("  Path: {LocalPath}", localTestPath);
 
-            var result = processSpawner.SpawnProcessWithToken(
+            var localArgs = $"\"{localTestPath}\" \"Local delegation test - {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC\"";
+            var localResult = processSpawner.SpawnProcessWithToken(
                 delegatedToken,
                 executablePath,
-                arguments,
-                timeoutSeconds * 1000); // Convert seconds to milliseconds
+                localArgs,
+                timeoutSeconds * 1000);
 
-            // Step 10: Display process execution results
-            Log.Information("");
-            Log.Information("Process Execution Results:");
-            Log.Information("Exit Code: {ExitCode}", result.ExitCode);
-            Log.Information("Execution Time: {ExecutionTime:F2} seconds", result.ExecutionTime.TotalSeconds);
-            Log.Information("Timed Out: {TimedOut}", result.TimedOut);
-            Log.Information("");
+            Log.Information("Stage 1 result: ExitCode={ExitCode}, TimedOut={TimedOut}, Time={Time:F2}s",
+                localResult.ExitCode, localResult.TimedOut, localResult.ExecutionTime.TotalSeconds);
 
-            if (!string.IsNullOrWhiteSpace(result.StandardOutput))
+            if (!string.IsNullOrWhiteSpace(localResult.StandardOutput))
+                Log.Information("Stage 1 stdout:\n{Output}", localResult.StandardOutput.TrimEnd());
+            if (!string.IsNullOrWhiteSpace(localResult.StandardError))
+                Log.Warning("Stage 1 stderr:\n{Output}", localResult.StandardError.TrimEnd());
+
+            if (!localResult.IsSuccess)
             {
-                Log.Information("Standard Output:");
-                Log.Information("----------------");
-                Log.Information("{StandardOutput}", result.StandardOutput);
-                Log.Information("");
+                Log.Error("Stage 1 FAILED — local write did not succeed (exit code {ExitCode}). " +
+                          "The spawned process token is invalid or the process could not start. " +
+                          "Skipping network share test.", localResult.ExitCode);
+                return 3;
             }
 
-            if (!string.IsNullOrWhiteSpace(result.StandardError))
+            Log.Information("Stage 1 PASSED — spawned process can write locally as the delegated user");
+            Log.Information("─────────────────────────────────────────────────────");
+
+            // ── Stage 2: Network share write test ────────────────────────────────
+            // Only reached if Stage 1 passed. A failure here means the Kerberos
+            // delegation to the file server (S4U2Proxy / cifs SPN) is the problem,
+            // not the token or the spawn mechanism.
+            Log.Information("Stage 2: Network share write test");
+            Log.Information("  Path: {SharePath}", fileSharePath);
+
+            var shareArgs = $"\"{fileSharePath}\" \"Network delegation test - {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC\"";
+            var shareResult = processSpawner.SpawnProcessWithToken(
+                delegatedToken,
+                executablePath,
+                shareArgs,
+                timeoutSeconds * 1000);
+
+            Log.Information("Stage 2 result: ExitCode={ExitCode}, TimedOut={TimedOut}, Time={Time:F2}s",
+                shareResult.ExitCode, shareResult.TimedOut, shareResult.ExecutionTime.TotalSeconds);
+
+            if (!string.IsNullOrWhiteSpace(shareResult.StandardOutput))
+                Log.Information("Stage 2 stdout:\n{Output}", shareResult.StandardOutput.TrimEnd());
+            if (!string.IsNullOrWhiteSpace(shareResult.StandardError))
+                Log.Warning("Stage 2 stderr:\n{Output}", shareResult.StandardError.TrimEnd());
+
+            if (!shareResult.IsSuccess)
             {
-                Log.Warning("Standard Error:");
-                Log.Warning("---------------");
-                Log.Warning("{StandardError}", result.StandardError);
-                Log.Information("");
+                Log.Error("Stage 2 FAILED — network share write did not succeed (exit code {ExitCode}). " +
+                          "Stage 1 passed so the token and spawn are fine. " +
+                          "Check: cifs SPN registration, constrained delegation config in AD, " +
+                          "share/NTFS permissions for {TargetUser}.",
+                          shareResult.ExitCode, targetUsername);
+                return 3;
             }
 
-            // Step 11: Return appropriate exit code
-            if (result.IsSuccess)
-            {
-                Log.Information("SUCCESS: Delegation and file write completed successfully");
-                return 0; // Exit code 0 for success
-            }
-            else
-            {
-                Log.Error("Process failed with exit code {ExitCode}", result.ExitCode);
-                if (result.TimedOut)
-                {
-                    Log.Error("Process exceeded timeout of {Timeout} seconds", timeoutSeconds);
-                }
-                return 3; // Exit code 3 for process failure
-            }
+            Log.Information("Stage 2 PASSED — network share write succeeded");
+            Log.Information("─────────────────────────────────────────────────────");
+            Log.Information("SUCCESS: Both local and network write tests passed");
+            return 0;
         }
         catch (KerberosException ex)
         {

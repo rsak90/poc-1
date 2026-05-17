@@ -61,13 +61,19 @@ public sealed class ProcessSpawner : IProcessSpawner
             CreatePipe(out stdOutRead, out stdOutWrite, true);
             CreatePipe(out stdErrRead, out stdErrWrite, true);
 
-            // Step 3: Prepare process startup information
+            // Step 3: Prepare process startup information.
+            // IMPORTANT: Do NOT set STARTF_USESHOWWINDOW — CreateProcessWithTokenW creates
+            // a new window station for the token's logon session and combining that flag
+            // with SW_HIDE causes error 1436 (child windows cannot have menus).
+            // CREATE_NO_WINDOW in the creation flags is sufficient to suppress the window.
+            // hStdInput must be NULL (not GetStdHandle) when running without a console
+            // (e.g. as a service) because GetStdHandle returns INVALID_HANDLE_VALUE there.
             var startupInfo = new NativeMethods.STARTUPINFO
             {
                 cb = Marshal.SizeOf<NativeMethods.STARTUPINFO>(),
-                dwFlags = NativeMethods.STARTF_USESHOWWINDOW | NativeMethods.STARTF_USESTDHANDLES,
-                wShowWindow = NativeMethods.SW_HIDE,
-                hStdInput = NativeMethods.GetStdHandle(NativeMethods.STD_INPUT_HANDLE),
+                dwFlags = NativeMethods.STARTF_USESTDHANDLES,   // no STARTF_USESHOWWINDOW
+                wShowWindow = 0,
+                hStdInput = IntPtr.Zero,                         // NULL = no stdin
                 hStdOutput = stdOutWrite.DangerousGetHandle(),
                 hStdError = stdErrWrite.DangerousGetHandle()
             };
@@ -105,7 +111,8 @@ public sealed class ProcessSpawner : IProcessSpawner
             {
                 var error = Marshal.GetLastWin32Error();
                 throw new KerberosException(
-                    $"CreateProcessWithTokenW failed with error: 0x{error:X8}",
+                    $"CreateProcessWithTokenW failed. Win32 error: {error} (0x{error:X8}). " +
+                    $"Executable: {executablePath}",
                     error,
                     KerberosErrorType.ProcessSpawnFailed);
             }
