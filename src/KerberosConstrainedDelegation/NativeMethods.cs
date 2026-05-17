@@ -116,6 +116,9 @@ internal static class NativeMethods
     public const int TokenGroupsAndPrivileges = 13;
     public const int TokenSessionReference = 14;
     public const int TokenSandBoxInert = 15;
+    public const int TokenElevationType = 18;
+    public const int TokenLinkedToken = 19;
+    public const int TokenElevation = 20;
 
     // Security Attributes
     public const int SECURITY_SQOS_PRESENT = 0x00100000;
